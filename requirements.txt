@@ -56,6 +56,7 @@ langchain-community==0.4.2
 langchain-core==1.4.0
 langchain-experimental==0.4.2
 langchain-openai==1.2.2
+langchain-ollama
 langchain-protocol==0.0.15
 langchain-text-splitters==1.1.2
 langsmith==0.8.5

@@ -215,16 +215,13 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error("Table model warmup failed (first PDF upload pays this cost instead): %s", e)
 
-    # Phase H #10 — refuse to start with no OPENAI_API_KEY at all; nothing
-    # in this app (embeddings, summarisation, chat, vision) works without
-    # it, so failing at boot beats failing three requests deep. Any
-    # environment that already sets this (every currently-working
-    # deployment) is unaffected.
-    if not settings.OPENAI_API_KEY:
+    # Phase H #10 — refuse to start with neither OpenAI nor a reachable local
+    # Ollama fallback. Local demos intentionally run with OPENAI_API_KEY blank,
+    # but only if Ollama is actually reachable.
+    if not settings.OPENAI_API_KEY and not settings.use_ollama:
         raise RuntimeError(
-            "OPENAI_API_KEY is not set — this app cannot function without it "
-            "(embeddings, summarisation, chat, and image captioning all require it). "
-            "Set it in your environment before starting."
+            "OPENAI_API_KEY is not set and Ollama is not reachable. "
+            "Set OPENAI_API_KEY or start Ollama with the configured local models."
         )
 
     # If this fires in a real deployment, the signed preview file links

@@ -62,6 +62,66 @@ SessionFactory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 _ISOLATED_TABLES = ["documents", "chat_threads", "chat_messages"]
 
 
+def _bootstrap_schema_upgrades(conn) -> None:
+    """
+    Small idempotent upgrades for databases created by older app versions.
+
+    SQLAlchemy's create_all() creates missing tables but does not ALTER
+    existing ones. Without these guards, an older local/demo database can
+    boot-loop before the app ever reaches normal request handling.
+    """
+    conn.execute(text("""
+        ALTER TABLE chat_threads
+        ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(128) NOT NULL DEFAULT 'default'
+    """))
+    conn.execute(text("""
+        ALTER TABLE chat_threads
+        ADD COLUMN IF NOT EXISTS org_unit_id VARCHAR(128) NOT NULL DEFAULT 'default'
+    """))
+    conn.execute(text("""
+        ALTER TABLE chat_messages
+        ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(128) NOT NULL DEFAULT 'default'
+    """))
+    conn.execute(text("""
+        ALTER TABLE chat_messages
+        ADD COLUMN IF NOT EXISTS org_unit_id VARCHAR(128) NOT NULL DEFAULT 'default'
+    """))
+    conn.execute(text("""
+        ALTER TABLE chat_messages
+        ADD COLUMN IF NOT EXISTS has_image BOOLEAN NOT NULL DEFAULT false
+    """))
+    conn.execute(text("""
+        ALTER TABLE chat_messages
+        ADD COLUMN IF NOT EXISTS image_caption TEXT
+    """))
+
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_chat_threads_tenant_id
+        ON chat_threads (tenant_id)
+    """))
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_chat_threads_org_unit_id
+        ON chat_threads (org_unit_id)
+    """))
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_chat_threads_tenant_org_user
+        ON chat_threads (tenant_id, org_unit_id, user_id)
+    """))
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_chat_messages_tenant_id
+        ON chat_messages (tenant_id)
+    """))
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_chat_messages_org_unit_id
+        ON chat_messages (org_unit_id)
+    """))
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_chat_messages_tenant_org
+        ON chat_messages (tenant_id, org_unit_id)
+    """))
+    logger.info("Schema upgrade guards verified.")
+
+
 def _bootstrap_app_role(conn) -> None:
     """
     Create (or update the password of) the restricted application role
@@ -160,6 +220,7 @@ def init_db() -> None:
         logger.info("Database tables verified / created successfully.")
 
         with _admin_engine.begin() as conn:
+            _bootstrap_schema_upgrades(conn)
             _bootstrap_app_role(conn)
             _bootstrap_rls(conn)
 

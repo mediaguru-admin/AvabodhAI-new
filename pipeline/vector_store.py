@@ -50,6 +50,10 @@ DENSE_VECTOR_NAME = "dense"
 SPARSE_VECTOR_NAME = "splade"
 
 
+def _dense_vector_size() -> int:
+    return settings.OLLAMA_EMBEDDING_DIMENSIONS if settings.use_ollama else settings.EMBEDDING_DIMENSIONS
+
+
 def _client() -> QdrantClient:
     """
     Module-singleton-ish client. Not cached in a global on purpose — the
@@ -88,7 +92,7 @@ def _ensure_chunks_collection(client: QdrantClient) -> None:
             collection_name=settings.QDRANT_COLLECTION,
             vectors_config={
                 DENSE_VECTOR_NAME: models.VectorParams(
-                    size=settings.EMBEDDING_DIMENSIONS,
+                    size=_dense_vector_size(),
                     distance=models.Distance.COSINE,
                 ),
             },
@@ -124,7 +128,7 @@ def _ensure_chat_collection(client: QdrantClient) -> None:
             collection_name=settings.QDRANT_CHAT_COLLECTION,
             vectors_config={
                 DENSE_VECTOR_NAME: models.VectorParams(
-                    size=settings.EMBEDDING_DIMENSIONS,
+                    size=_dense_vector_size(),
                     distance=models.Distance.COSINE,
                 ),
             },
