@@ -164,7 +164,10 @@ def generate_search_queries(query: str, history_messages: list, document_summary
             f"terms, not to answer the question):\n{document_summary}\n\n"
             if document_summary else ""
         )
-        llm = ChatOpenAI(api_key=settings.OPENAI_API_KEY, model=settings.MAP_MODEL, temperature=0.0)
+        # Use the same provider fallback as the rest of the chat pipeline.
+        # Calling ChatOpenAI directly here fails on Ollama-only deployments
+        # as soon as a thread has history (the first message skips this path).
+        llm = _build_llm(streaming=False, for_answer=False)
         structured_llm = llm.with_structured_output(SearchQueries)
         result: SearchQueries = structured_llm.invoke(
             f"{summary_block}"

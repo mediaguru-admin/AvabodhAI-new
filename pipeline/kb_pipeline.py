@@ -329,9 +329,9 @@ async def chat_with_kb(
     )
     for rec in history_records:
         if rec.role == "human":
-            memory.chat_memory.add_user_message(rec.content)
+            memory.add_user_message(rec.content)
         else:
-            memory.chat_memory.add_ai_message(rec.content)
+            memory.add_ai_message(rec.content)
 
     # 3. Setup retrieval and compression
     retriever = get_compression_retriever(owner_id)

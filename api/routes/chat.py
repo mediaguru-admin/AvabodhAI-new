@@ -275,7 +275,12 @@ def _retrieve_chunks_sync(request: ChatMessageRequest, tenant_id: str, org_unit_
 async def _prepare_chat(request: ChatMessageRequest, tenant_id: str, org_unit_id: str, db: Session) -> tuple:
     is_new_thread = False
     if request.thread_id is None:
-        thread = create_thread(tenant_id=tenant_id, org_unit_id=org_unit_id, doc_filter=request.doc_filter)
+        # A thread created implicitly by the global chat endpoint is a global
+        # conversation.  The document filter belongs to this request only;
+        # persisting it on the thread makes the UI treat the first document as
+        # the scope for every later message.  Explicit document-chat threads
+        # are still created through POST /chat/threads and retain doc_filter.
+        thread = create_thread(tenant_id=tenant_id, org_unit_id=org_unit_id, doc_filter=None)
         thread_id = str(thread.id)
         is_new_thread = True
     else:

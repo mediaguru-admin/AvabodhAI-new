@@ -294,6 +294,7 @@ class Settings(BaseSettings):
 
     def __init__(self, **data: Any):
         merged = self._load_env_file_data()
+        merged.update(os.environ)
         merged.update(data)
 
         # Drop keys this class doesn't declare BEFORE pydantic sees them.

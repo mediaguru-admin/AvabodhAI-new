@@ -45,6 +45,10 @@ from fastembed import SparseTextEmbedding
 # actually supports (see RERANK_MODEL in config/settings.py).
 from fastembed.rerank.cross_encoder import TextCrossEncoder
 from langchain_openai import OpenAIEmbeddings
+try:
+    from langchain_ollama import OllamaEmbeddings
+except ImportError:
+    OllamaEmbeddings = None
 
 from config.settings import get_settings
 from utils.logger import get_logger
@@ -54,7 +58,14 @@ settings = get_settings()
 
 
 @lru_cache
-def _dense_client() -> OpenAIEmbeddings:
+def _dense_client():
+    if settings.use_ollama:
+        if OllamaEmbeddings is None:
+            raise RuntimeError("Ollama mode requires langchain-ollama. Install requirements.txt.")
+        return OllamaEmbeddings(
+            model=settings.OLLAMA_EMBEDDING_MODEL,
+            base_url=settings.ollama_url,
+        )
     return OpenAIEmbeddings(api_key=settings.OPENAI_API_KEY, model=settings.EMBEDDING_MODEL)
 
 
