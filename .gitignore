@@ -23,6 +23,7 @@ logs/
 # Uploaded files — user private data
 uploaded_files/
 documents/
+graphify-out/
 
 # Database
 *.db

@@ -10,22 +10,20 @@ Window = last N turns only (not entire history) to avoid token overflow.
 """
 import io
 import os
+import uuid
 from typing import Optional
 import pandas as pd
 from sqlalchemy.orm import Session
 from langchain_classic.memory import ConversationBufferWindowMemory
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
-from db.models import ChatMessage
+from db.models import ChatMessage, ChatThread
+from pipeline import embedder, vector_store
 from config.settings import get_settings
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 settings = get_settings()
-
-# How many past turns to include in context
-# 1 turn = 1 human + 1 AI message
-MEMORY_WINDOW_SIZE = 5
 
 
 def _flatten_table_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -142,13 +140,48 @@ def select_attachable_crops(context_chunks: list[dict], limit: Optional[int] = N
     return selected
 
 
-def load_memory_from_db(thread_id: str, tenant_id: str, org_unit_id: str, db: Session) -> ConversationBufferWindowMemory:
+def load_memory_from_db(
+    thread_id: str, tenant_id: str, org_unit_id: str, db: Session,
+) -> tuple[ConversationBufferWindowMemory, Optional[str], set[str]]:
     """
-    Load last N turns from chat_messages table.
-    Returns a ConversationBufferWindowMemory with history injected.
+    Returns (memory, rolling_summary, window_message_ids):
+      - memory: ConversationBufferWindowMemory holding every message since
+        rolling_summary_through, injected verbatim.
+      - rolling_summary: ChatThread.rolling_summary — everything UP TO
+        rolling_summary_through, compressed (see pipeline/chat_storage.py::
+        update_rolling_summary()). None for a thread with no summary yet.
+      - window_message_ids: the ChatMessage.id values already included
+        verbatim in `memory` — passed to select_relevant_history() below
+        so semantic recall never re-surfaces a message the prompt is
+        already sending in full.
 
-    This is called on every request — memory is rebuilt from DB each time.
-    This ensures consistency even if server restarts.
+    2026-09-23 — the window is no longer a fixed "last N turns". It is
+    defined as "every message after rolling_summary_through", whatever
+    that count happens to be. Summary and window are two halves of one
+    partition of the thread's full history — they meet exactly, by
+    construction, instead of being computed independently and only
+    USUALLY lining up.
+
+    Why that matters: pipeline/chat_storage.py::update_rolling_summary()
+    can lag behind — a slow LLM call, a transient failure it's still
+    retrying, or (if it's ever moved off the request path, e.g. to a
+    background task) simply not having run yet for this turn. With the
+    OLD fixed-N window, a lagging summarizer meant messages that had aged
+    out of the window but weren't in the summary yet were in NEITHER —
+    invisible to the model. With the window derived from
+    rolling_summary_through instead, a lagging summarizer just means
+    the window is bigger for this one prompt; nothing is ever dropped.
+
+    settings.MEMORY_WINDOW_SIZE still does exactly what it did before in
+    the normal case: update_rolling_summary() only advances
+    rolling_summary_through once a thread has more than
+    MEMORY_WINDOW_SIZE turns past it (see that function), so in steady
+    state (summarizer keeping pace) rolling_summary_through sits at
+    total_messages - MEMORY_WINDOW_SIZE*2 and this query naturally returns
+    the same "last N turns" as before. MEMORY_WINDOW_SIZE is the
+    configured fallback/steady-state size, not a hard cap — it only stops
+    being the literal window size when the background job is behind,
+    which is exactly the case where showing MORE history is correct.
 
     tenant_id + org_unit_id: filtered here even though thread_id alone is
     already effectively unique to one tenant+org_unit (every
@@ -158,31 +191,39 @@ def load_memory_from_db(thread_id: str, tenant_id: str, org_unit_id: str, db: Se
     call). Filtering by both anyway means this query stays correct even
     if that upstream check is ever refactored away.
     """
-    memory = ConversationBufferWindowMemory(
-        k=MEMORY_WINDOW_SIZE,
-        return_messages=True,
-        memory_key="chat_history",
-        input_key="query",
-        output_key="answer",
-    )
+    window_message_ids: set[str] = set()
+    rolling_summary: Optional[str] = None
+    rolling_summary_through = 0
 
     try:
-        # Last N*2 messages (N turns = N human + N AI).
-        #
-        # 2026-08-23 — this was ORDER BY created_at ASC LIMIT 10, which takes
-        # the OLDEST ten messages, not the newest. The window therefore froze
-        # at a thread's FIRST five turns and never advanced: turn 40 saw the
-        # same history as turn 6. Confirmed against live data (a 24-message
-        # thread whose memory still held only its opening Afrobeats turns,
-        # where the user asked "can you repeat the last response?" and got an
-        # answer from twenty messages earlier). Not just a display problem —
-        # pipeline/chat.py::generate_search_queries() condenses follow-ups
-        # against these same messages, so the stale window also sent
-        # RETRIEVAL after the wrong topic before an answer was attempted.
-        #
-        # DESC + limit + reverse: let Postgres do the "newest N" (it can use
-        # the thread_id index and stop early) and restore chronological order
-        # in Python, rather than pulling the whole thread back to slice it.
+        thread = db.query(ChatThread).filter(
+            ChatThread.id == uuid.UUID(thread_id),
+            ChatThread.tenant_id == tenant_id,
+            ChatThread.org_unit_id == org_unit_id,
+        ).first()
+        if thread:
+            rolling_summary = thread.rolling_summary
+            rolling_summary_through = thread.rolling_summary_through or 0
+    except Exception as e:
+        logger.warning("Rolling summary load failed for thread %s: %s", thread_id, e)
+
+    # 2026-08-23 — this used to be ORDER BY created_at ASC LIMIT 10 (no
+    # offset), which took the OLDEST ten messages, not the newest — the
+    # window froze at a thread's first five turns and never advanced.
+    # Confirmed against live data (a 24-message thread whose memory still
+    # held only its opening turns, where "can you repeat the last
+    # response?" got an answer from twenty messages earlier). Not just a
+    # display problem — pipeline/chat.py::generate_search_queries()
+    # condenses follow-ups against these same messages, so the stale
+    # window sent retrieval after the wrong topic too.
+    #
+    # ASC + OFFSET(rolling_summary_through), no LIMIT: returns exactly
+    # "everything not yet folded into the summary" — see this function's
+    # docstring for why that replaced a fixed LIMIT. Postgres can seek to
+    # the offset via the thread_id/created_at index rather than pulling
+    # the whole thread back to slice it in Python, same performance shape
+    # as the old DESC+LIMIT+reverse approach in the steady-state case.
+    try:
         messages = (
             db.query(ChatMessage)
             .filter(
@@ -190,12 +231,30 @@ def load_memory_from_db(thread_id: str, tenant_id: str, org_unit_id: str, db: Se
                 ChatMessage.tenant_id == tenant_id,
                 ChatMessage.org_unit_id == org_unit_id,
             )
-            .order_by(ChatMessage.created_at.desc())
-            .limit(MEMORY_WINDOW_SIZE * 2)
+            .order_by(ChatMessage.created_at.asc())
+            .offset(rolling_summary_through)
             .all()
         )
-        messages.reverse()   # back to oldest-first for the pairing walk below
+    except Exception as e:
+        logger.warning("Memory load failed for thread %s: %s", thread_id, e)
+        messages = []
 
+    # k must be at least as large as what we're about to inject —
+    # ConversationBufferWindowMemory does its OWN trimming to the last k
+    # exchanges, which would otherwise silently re-truncate this back down
+    # to settings.MEMORY_WINDOW_SIZE turns even when we deliberately
+    # included more to cover a lagging summarizer. len(messages) (a
+    # message count) is always >= the true turn count, so it's a safe
+    # upper bound without needing to pre-count pairs.
+    memory = ConversationBufferWindowMemory(
+        k=max(settings.MEMORY_WINDOW_SIZE, len(messages)),
+        return_messages=True,
+        memory_key="chat_history",
+        input_key="query",
+        output_key="answer",
+    )
+
+    try:
         # Inject messages into memory in pairs (human, ai)
         i = 0
         while i < len(messages) - 1:
@@ -235,6 +294,8 @@ def load_memory_from_db(thread_id: str, tenant_id: str, org_unit_id: str, db: Se
                     {"query": query_text},
                     {"answer": ai_msg.content},
                 )
+                window_message_ids.add(str(human_msg.id))
+                window_message_ids.add(str(ai_msg.id))
                 i += 2
             else:
                 i += 1
@@ -247,7 +308,47 @@ def load_memory_from_db(thread_id: str, tenant_id: str, org_unit_id: str, db: Se
     except Exception as e:
         logger.warning("Memory load failed for thread %s: %s", thread_id, e)
 
-    return memory
+    return memory, rolling_summary, window_message_ids
+
+
+def select_relevant_history(
+    query: str, thread_id: str, tenant_id: str, org_unit_id: str,
+    exclude_ids: set[str],
+) -> list[dict]:
+    """
+    Semantic-recall layer: embeds the CURRENT query and matches it against
+    every past message in this thread (already indexed in Qdrant's
+    avabodh_chat_messages collection at save time — see
+    pipeline/chat_storage.py::_index_message_in_qdrant), scoped to this
+    thread_id only via vector_store.search_chat()'s thread_id filter.
+
+    exclude_ids: the message ids already sent verbatim in the recency
+    window (pipeline/memory.py::load_memory_from_db's window_message_ids)
+    — filtered out here so a message never appears twice in the prompt.
+
+    Non-fatal by design, same as shortlist_documents()/_mmr_select(): a
+    failure here should degrade to "no extra recall," never break the
+    chat turn — the recency window and rolling summary still carry the
+    conversation on their own.
+    """
+    limit = settings.MEMORY_SEMANTIC_RECALL_LIMIT
+    if not query or not query.strip() or limit <= 0:
+        return []
+
+    try:
+        dense_vector = embedder.embed_dense_query(query)
+        hits = vector_store.search_chat(
+            tenant_id=tenant_id, org_unit_id=org_unit_id,
+            dense_vector=dense_vector,
+            top_k=limit + len(exclude_ids),
+            thread_id=thread_id,
+        )
+    except Exception as e:
+        logger.warning("Semantic recall over chat history failed (non-fatal): %s", e)
+        return []
+
+    results = [h for h in hits if h.get("message_id") not in exclude_ids]
+    return results[:limit]
 
 
 def build_prompt_with_history(
@@ -256,12 +357,16 @@ def build_prompt_with_history(
     context_chunks: list[dict],
     doc_filter: Optional[str] = None,
     attach_crops: bool = True,
+    rolling_summary: Optional[str] = None,
+    relevant_history: Optional[list[dict]] = None,
 ) -> str:
     """
     Build the full prompt string:
     - System instructions
     - Retrieved document context
-    - Conversation history
+    - Earlier conversation summary (turns older than the recency window)
+    - Relevant earlier messages (semantic recall — specific older facts)
+    - Conversation history (recency window, verbatim)
     - Current query
 
     attach_crops: whether the caller is actually going to attach the
@@ -272,6 +377,12 @@ def build_prompt_with_history(
     image. Set False only if the call genuinely can't carry images, in
     which case every visual falls back to its ingestion-time Vision
     caption, i.e. exactly the pre-2026-08-23 behavior.
+
+    rolling_summary / relevant_history: pipeline/chat_storage.py's
+    ChatThread.rolling_summary and pipeline/memory.py::
+    select_relevant_history()'s output — both optional so a thread still
+    inside its first recency window (nothing has aged out, no recall
+    needed yet) renders exactly the pre-2026-09-23 prompt shape.
     """
     from typing import Optional
 
@@ -293,12 +404,14 @@ def build_prompt_with_history(
 
 RULES:
 1. SOURCE: Answer only from the data below — never outside knowledge, though related reasoning over that data is appreciated. Take ALL of it into account before answering, and apply semantic sense to complex queries.
-2. RESPONSE SCHEMA — mandatory, no exceptions: the answer stated concisely in your own words, then the [Source: ...] tag at the end, nothing else.
+2. RESPONSE SCHEMA — mandatory, no exceptions: the answer stated concisely in your own words but within one sentence, then the [Source: ...] tag at the end, nothing else.
 3. PARTIAL DATA: State exactly what IS known, then stop — do not follow it with "I don't have enough information," that's a contradiction, and never open with what the documents do NOT say. Lead with the fact you have. Partial facts are still an answer.
 4. CALCULATION: If the documents don't state something directly, find data to calculate it from — including POSSIBLY HELPFUL TABLES, which you may extract from, compute on, and reason over. Exact figures to 2 decimal places, never rounded off or approximate. If calculation isn't possible either, reason it out.
 5. CITATION: Cite only the [Source: doc_name, page N] or [Source: doc_name, Section: heading] tag exactly as it appears in the context below — never invent a citation format.
 6. IMAGE CAPTIONS: Some context is images (charts, tables, diagrams) captioned by GPT-4o Vision. Treat it with the same confidence as document text and cite it the same way.
-7. ATTACHED VISUALS: Items listed in DOCUMENT CONTEXT as "ATTACHED VISUAL k of N" are actual images attached to this message, deliberately carrying no written description — the image itself is the data. Read the pixels: transcribe the exact axis values, labels, legend entries and row/column figures, and compute from them when the question needs a total, difference, share or ratio. A visual with no description is NOT missing information; "the description doesn't say" is never a valid reason to refuse when the visual is attached.
+7. ATTACHED VISUALS: Items listed in DOCUMENT CONTEXT as "ATTACHED VISUAL k of N" are actual images attached to this message, deliberately carrying no written description — the image itself is the data. Read the pixels: transcribe the exact axis values, labels, legend entries and row/column figures, and compute from them when the question has a relation to them. A visual with no description is NOT missing information; "the description doesn't say" is never a valid reason to refuse when the visual is attached.
+8. DIVERSITY: The answer to the query/question can be across multiple chunks/data points, images or tables. You haev to handle them efficiecntly going through the entire content before replying. You might also need to perfrom cross-data calculations, make sure you handle them efficiently.
+9. CONVERSATION MEMORY: EARLIER CONVERSATION SUMMARY, RELEVANT EARLIER MESSAGES, and CONVERSATION HISTORY are conversation context, not document sources — use them to understand what was already discussed, resolve follow-ups ("it", "that project", "the one you mentioned"), and avoid repeating yourself, but never cite them with a [Source: ...] tag; only DOCUMENT CONTEXT and POSSIBLY HELPFUL TABLES are citable sources.
 """
     # Document context from retrieved chunks — text and image chunks are
     # formatted differently so the LLM knows which parts came from GPT-4o
@@ -448,6 +561,21 @@ The image itself is attached to this message as visual {pos} of {n_attached} (do
                 history_parts.append(f"Assistant: {msg.content}")
         history_str = "\n".join(history_parts)
 
+    # Earlier conversation summary — everything older than the recency
+    # window, compressed by pipeline/chat_storage.py::update_rolling_summary().
+    summary_str = rolling_summary.strip() if rolling_summary and rolling_summary.strip() else "No earlier conversation to summarise yet."
+
+    # Relevant earlier messages — semantic recall (select_relevant_history()
+    # above), specific facts from anywhere in the thread that the recency
+    # window and the (necessarily lossy) summary might not carry.
+    recall_str = "None retrieved for this question."
+    if relevant_history:
+        recall_parts = []
+        for h in relevant_history:
+            role_label = "Human" if h.get("role") == "human" else "Assistant"
+            recall_parts.append(f"{role_label} (earlier in this conversation): {h.get('content', '')}")
+        recall_str = "\n".join(recall_parts)
+
     # Build full prompt
     prompt = f"""{system}
 
@@ -460,7 +588,13 @@ DOCUMENT CONTEXT:
 POSSIBLY HELPFUL TABLES:
 {tables_str}
 
-CONVERSATION HISTORY:
+EARLIER CONVERSATION SUMMARY (older turns, compressed):
+{summary_str}
+
+RELEVANT EARLIER MESSAGES (semantically matched to the current question, may be from earlier than the summary above):
+{recall_str}
+
+CONVERSATION HISTORY (most recent turns, verbatim):
 {history_str if history_str else "No previous conversation."}
 
 

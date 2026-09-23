@@ -21,6 +21,7 @@ expensive to (re)load, and are safe to reuse across requests):
            fastembed/ONNX dependency family as the sparse model
 """
 
+import time
 from functools import lru_cache
 from typing import Optional
 
@@ -77,20 +78,48 @@ def embed_dense_query(text: str) -> list[float]:
 
 
 def embed_dense_batch(texts: list[str], batch_size: Optional[int] = None) -> list[list[float]]:
-    """Batched dense embedding — mirrors the old store_chunk_embeddings() batching behavior."""
+    """
+    Batched dense embedding — mirrors the old store_chunk_embeddings() batching behavior.
+
+    Each batch gets settings.EMBEDDING_MAX_RETRIES retries (most failures
+    here are transient: rate limits, network blips) before giving up.
+    Exhausting retries on any one batch stops the whole document rather
+    than skipping that batch and moving to the next — a skipped batch
+    means its chunks are silently absent from the vector store with no
+    indication anything is missing, which is worse than an explicit,
+    retryable failure. A correlated failure (rate limit, bad key) would
+    likely fail the next batch too anyway, so there's little to gain from
+    pressing on.
+    """
     if not texts:
         return []
     batch_size = batch_size or settings.EMBEDDING_BATCH_SIZE
+    max_retries = max(0, settings.EMBEDDING_MAX_RETRIES)
     client = _dense_client()
     out: list[list[float]] = []
     total_batches = (len(texts) + batch_size - 1) // batch_size
     for i in range(0, len(texts), batch_size):
+        batch_num = (i // batch_size) + 1
         batch = texts[i : i + batch_size]
-        try:
-            out.extend(client.embed_documents(batch))
-            logger.info("Dense-embedded batch %d/%d", (i // batch_size) + 1, total_batches)
-        except Exception as e:
-            raise RuntimeError(f"Dense embedding failed at batch {(i // batch_size) + 1}: {e}") from e
+        last_error: Exception | None = None
+        for attempt in range(1, max_retries + 2):  # +1 for the initial try, +1 for range's exclusivity
+            try:
+                out.extend(client.embed_documents(batch))
+                logger.info("Dense-embedded batch %d/%d (attempt %d)", batch_num, total_batches, attempt)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "Dense embedding batch %d/%d failed (attempt %d/%d): %s",
+                    batch_num, total_batches, attempt, max_retries + 1, e,
+                )
+                if attempt <= max_retries:
+                    time.sleep(2 ** (attempt - 1))  # 1s, 2s, 4s, ...
+        if last_error is not None:
+            raise RuntimeError(
+                f"Dense embedding failed at batch {batch_num} after {max_retries + 1} attempt(s): {last_error}"
+            ) from last_error
     return out
 
 

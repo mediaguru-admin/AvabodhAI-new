@@ -22,7 +22,7 @@ from typing import Optional
 
 from langchain_core.documents import Document as LCDocument
 
-from pipeline import extractor, chunker, embedder, vector_store, storage, summariser, object_store
+from pipeline import extractor, chunker, embedder, vector_store, storage, summariser, object_store, webhook
 from pipeline.image_processor import (
     extract_images_from_elements, extract_images_from_soup,
     caption_image_with_vision, build_image_embedding_text, compute_image_hash,
@@ -33,6 +33,24 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 settings = get_settings()
+
+
+def _run_stage(stage_name: str, fn, *args, **kwargs):
+    """
+    Runs one fatal pipeline stage, and if it raises, re-raises tagged with
+    which stage produced it and the real exception's type — not just its
+    bare message. Without this, status_detail on a FAILED document ends up
+    as whatever str(e) happens to be for the underlying library, which for
+    something like a raw socket timeout is just "timed out" with zero
+    indication of what was even being attempted or what kind of error it
+    was (network? library bug? bad input?) — useless for diagnosing a
+    specific failure from the UI alone, without cross-referencing live
+    server logs at the exact timestamp.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        raise RuntimeError(f"{stage_name} failed: {type(e).__name__}: {e}") from e
 
 
 def _index_text_chunks(
@@ -117,11 +135,60 @@ def _index_image_chunks(
     return vector_store.upsert_chunks(points)
 
 
+def _clear_document_index(document_id: str, tenant_id: str) -> None:
+    """
+    Clears both this document's chunks AND its document-summary point
+    (see _index_document_summary()) before re-ingesting. Without clearing
+    the summary point too, a reprocess that fails before reaching
+    summarization would leave a stale summary vector pointing at a
+    document whose chunks were just wiped — shortlist_documents() could
+    then shortlist a document with nothing actually retrievable inside it.
+    A fresh summary point gets written again at the end of a successful
+    run either way (deterministic ID, so it just overwrites).
+    """
+    vector_store.delete_document_points(tenant_id=tenant_id, document_id=str(document_id))
+    vector_store.delete_document_summary(tenant_id=tenant_id, document_id=str(document_id))
+
+
+def _index_document_summary(document_id: str, tenant_id: str, org_unit_id: str, doc_name: str, summary_text: str) -> None:
+    """
+    Embeds this document's summary and upserts it into
+    vector_store.QDRANT_DOC_SUMMARY_COLLECTION — backs
+    pipeline/retriever.py::shortlist_documents(), the first stage of
+    retrieval that narrows to relevant documents before chunk-level
+    search runs inside them. Best-effort: a failure here just means this
+    document won't be shortlisted first (shortlist_documents() falls back
+    to full-corpus search when nothing's shortlisted), never something
+    that should fail an otherwise-successful ingestion.
+    """
+    if not summary_text.strip():
+        return
+    try:
+        dense_vector = embedder.embed_dense_query(summary_text)
+        sparse_indices, sparse_values = embedder.embed_sparse_query(summary_text)
+        vector_store.upsert_document_summary(
+            document_id=document_id, tenant_id=tenant_id, org_unit_id=org_unit_id,
+            doc_name=doc_name, summary_text=summary_text,
+            dense_vector=dense_vector, sparse_indices=sparse_indices, sparse_values=sparse_values,
+        )
+    except Exception as e:
+        logger.warning(
+            "Document-summary indexing failed for document %s (non-fatal, won't be shortlisted first): %s",
+            document_id, e,
+        )
+
+
 def _summarise_and_apply(chunks: list[chunker.Chunk], document_id: str, tenant_id: str, org_unit_id: str, doc_name: str, page_count: int) -> None:
     """Non-fatal — chunk indexing (already done by the time this runs) is what matters for retrieval."""
     try:
         lc_docs = [LCDocument(page_content=c.text, metadata={"page": c.page_number}) for c in chunks]
         result = summariser.summarise_document(lc_docs, doc_name=doc_name)
+        if result.get("reduce_fallback_used"):
+            logger.warning(
+                "Document %s: Reduce step failed after retries, summary is the "
+                "raw joined chunk summaries, not a real Reduce pass",
+                document_id,
+            )
         storage.apply_summary(
             document_id=document_id, tenant_id=tenant_id, org_unit_id=org_unit_id,
             summary_text=result["summary_text"],
@@ -129,6 +196,10 @@ def _summarise_and_apply(chunks: list[chunker.Chunk], document_id: str, tenant_i
             chunk_count=len(chunks), page_count=page_count,
             model_used=result["reduce_model"],
             document_metadata=result.get("document_metadata"),
+        )
+        _index_document_summary(
+            document_id=document_id, tenant_id=tenant_id, org_unit_id=org_unit_id,
+            doc_name=doc_name, summary_text=result["summary_text"],
         )
     except Exception as e:
         logger.warning("Summarisation failed for document %s (non-fatal): %s", document_id, e)
@@ -250,21 +321,27 @@ def process_document(
     """
     metadata = metadata or {}
     storage.set_status(document_id, tenant_id, org_unit_id, "PROCESSING")
+    webhook.notify_status_change(document_id, tenant_id, org_unit_id, "PROCESSING")
 
     try:
-        vector_store.delete_document_points(tenant_id=tenant_id, document_id=str(document_id))
+        _run_stage(
+            "Clearing previous index", _clear_document_index,
+            tenant_id=tenant_id, document_id=str(document_id),
+        )
 
         if Path(file_path).suffix.lower() in extractor.STANDALONE_IMAGE_EXTENSIONS:
-            _process_standalone_image(
+            _run_stage(
+                "Standalone image processing", _process_standalone_image,
                 document_id, tenant_id, org_unit_id, file_path, doc_name, doc_hash,
                 is_ground_truth, metadata, effective_from, effective_to,
             )
             storage.set_status(document_id, tenant_id, org_unit_id, "READY")
+            webhook.notify_status_change(document_id, tenant_id, org_unit_id, "READY")
             logger.info("Ingestion complete for document %s ('%s') — standalone image", document_id, doc_name)
             return
 
-        extracted = extractor.extract_file(file_path)
-        chunks = chunker.chunk_document(extracted)
+        extracted = _run_stage("Text extraction", extractor.extract_file, file_path)
+        chunks = _run_stage("Chunking", chunker.chunk_document, extracted)
         # 2026-08-22: this used to raise as soon as `chunks` (TEXT chunks
         # only) came back empty — BEFORE the image/table-processing block
         # further down ever got a chance to run. An all-image PDF (scanned
@@ -279,7 +356,8 @@ def process_document(
             raise RuntimeError("No meaningful content extracted from this document")
 
         if chunks:
-            _index_text_chunks(
+            _run_stage(
+                "Chunk embedding/indexing", _index_text_chunks,
                 chunks, str(document_id), tenant_id, org_unit_id, doc_hash, doc_name,
                 is_ground_truth, extracted.source_path, metadata,
                 effective_from=effective_from, effective_to=effective_to,
@@ -348,7 +426,12 @@ def process_document(
         # image_type="table" itself, no separate role needed.
         tables_needing_vision = [
             el for el in extracted.table_elements
-            if not table_html_is_reliable(getattr(el.metadata, "text_as_html", None))
+            if not table_html_is_reliable(
+                getattr(el.metadata, "text_as_html", None),
+                # None when the page is unknown/unmeasured — treated as
+                # "assume fine" by table_html_is_reliable().
+                extracted.page_text_chars.get(getattr(el.metadata, "page_number", None)),
+            )
         ]
         if extracted.table_elements:
             logger.info(
@@ -393,11 +476,19 @@ def process_document(
             storage.set_image_count(document_id, tenant_id, org_unit_id, total_images_indexed)
 
         storage.set_status(document_id, tenant_id, org_unit_id, "READY")
+        webhook.notify_status_change(document_id, tenant_id, org_unit_id, "READY")
         logger.info("Ingestion complete for document %s ('%s') — %d chunks", document_id, doc_name, len(chunks))
 
     except Exception as e:
-        logger.error("Ingestion FAILED for document %s ('%s'): %s", document_id, doc_name, e)
-        storage.set_status(document_id, tenant_id, org_unit_id, "FAILED", status_detail=str(e)[:2000])
+        # Full traceback goes to the server log (exc_info=True) for live
+        # debugging; status_detail (what the UI shows via the webhook/
+        # check-status path) gets the shorter but still stage-tagged
+        # message from _run_stage — real diagnostic value without dumping
+        # a raw traceback into the document detail page.
+        logger.error("Ingestion FAILED for document %s ('%s'): %s", document_id, doc_name, e, exc_info=True)
+        error_detail = str(e)[:2000]
+        storage.set_status(document_id, tenant_id, org_unit_id, "FAILED", status_detail=error_detail)
+        webhook.notify_status_change(document_id, tenant_id, org_unit_id, "FAILED", status_detail=error_detail)
 
     finally:
         # 2026-08-23 - release the local copy the moment this job is done,
@@ -439,16 +530,23 @@ def process_web_document(
     """Web-scrape ingestion — pipeline/scraper.py already fetched + converted the page to markdown (+ kept raw_html for image extraction). effective_from/effective_to: see process_document()'s docstring."""
     metadata = metadata or {}
     storage.set_status(document_id, tenant_id, org_unit_id, "PROCESSING")
+    webhook.notify_status_change(document_id, tenant_id, org_unit_id, "PROCESSING")
 
     try:
-        vector_store.delete_document_points(tenant_id=tenant_id, document_id=str(document_id))
+        _run_stage(
+            "Clearing previous index", _clear_document_index,
+            tenant_id=tenant_id, document_id=str(document_id),
+        )
 
-        extracted = extractor.extract_web_markdown(markdown_text, doc_name, source_url)
-        chunks = chunker.chunk_document(extracted)
+        extracted = _run_stage(
+            "Text extraction", extractor.extract_web_markdown, markdown_text, doc_name, source_url,
+        )
+        chunks = _run_stage("Chunking", chunker.chunk_document, extracted)
         if not chunks:
             raise RuntimeError("No meaningful content extracted from this page")
 
-        _index_text_chunks(
+        _run_stage(
+            "Chunk embedding/indexing", _index_text_chunks,
             chunks, str(document_id), tenant_id, org_unit_id, doc_hash, doc_name,
             is_ground_truth, source_url, metadata,
             effective_from=effective_from, effective_to=effective_to,
@@ -484,8 +582,11 @@ def process_web_document(
             logger.info("Skipping image captioning for '%s' (caption_images=false)", doc_name)
 
         storage.set_status(document_id, tenant_id, org_unit_id, "READY")
+        webhook.notify_status_change(document_id, tenant_id, org_unit_id, "READY")
         logger.info("Web ingestion complete for document %s ('%s') — %d chunks", document_id, doc_name, len(chunks))
 
     except Exception as e:
-        logger.error("Web ingestion FAILED for document %s ('%s'): %s", document_id, doc_name, e)
-        storage.set_status(document_id, tenant_id, org_unit_id, "FAILED", status_detail=str(e)[:2000])
+        logger.error("Web ingestion FAILED for document %s ('%s'): %s", document_id, doc_name, e, exc_info=True)
+        error_detail = str(e)[:2000]
+        storage.set_status(document_id, tenant_id, org_unit_id, "FAILED", status_detail=error_detail)
+        webhook.notify_status_change(document_id, tenant_id, org_unit_id, "FAILED", status_detail=error_detail)

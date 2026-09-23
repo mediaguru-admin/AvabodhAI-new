@@ -82,6 +82,7 @@ def _reset_documents(where_sql, params, execute: bool) -> int:
     for r in rows:
         try:
             vector_store.delete_document_points(tenant_id=r.tenant_id, document_id=str(r.id))
+            vector_store.delete_document_summary(tenant_id=r.tenant_id, document_id=str(r.id))
         except Exception as e:
             logger.warning("Qdrant delete failed for document %s (continuing): %s", r.id, e)
         if r.stored_path and os.path.exists(r.stored_path):

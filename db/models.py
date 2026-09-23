@@ -250,6 +250,20 @@ class ChatThread(Base):
     user_id    = Column(String(256), nullable=True)
     doc_filter = Column(String(512), nullable=True)
     message_count = Column(Integer, default=0)
+
+    # ── Rolling conversation summary (pipeline/memory.py) ───────────────
+    # Incrementally-updated summary of every turn that has aged OUT of the
+    # recency window (MEMORY_WINDOW_SIZE turns, still sent verbatim). This
+    # is what lets the chat prompt "remember" a long thread's earlier
+    # topics without sending the whole transcript on every request.
+    # rolling_summary_through counts how many ChatMessage rows (chronological,
+    # human+ai both counted) are already folded into rolling_summary, so
+    # pipeline/chat_storage.py::update_rolling_summary() only ever
+    # summarises the NEW slice of aged-out messages, never re-summarising
+    # ones already folded in.
+    rolling_summary         = Column(Text, nullable=True)
+    rolling_summary_through = Column(Integer, nullable=False, default=0)
+
     created_at = Column(DateTime(timezone=True),
                         default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(DateTime(timezone=True),
@@ -298,6 +312,20 @@ class ChatMessage(Base):
     # queries Qdrant directly instead of this table's old pgvector column.
 
     sources   = Column(JSON, nullable=True)
+
+    # ── Retrieval degradation, internal only (2026-09-23) ───────────────
+    # Which components silently fell back to a degraded path while
+    # answering THIS turn — e.g. ["sparse_embedding"] (hybrid search ran
+    # dense-only, no keyword matching) or ["reranking"] (results were not
+    # re-sorted by relevance). None/empty when nothing degraded.
+    # Deliberately NOT on ChatMessageResponse or any API surface — this
+    # exists so degraded answers can be found and explained after the
+    # fact (e.g. "show me every turn from last week where reranking
+    # failed"), not to be shown to end users, who have no useful action to
+    # take on "the keyword search leg failed." See
+    # pipeline/retriever.py::search()'s degraded out-param, which is what
+    # actually observes each fallback as it happens.
+    degraded  = Column(JSON, nullable=True)
 
     # ── NEW — multimodal chat (image attached to this turn) ────────────────
     has_image     = Column(Boolean, nullable=False, default=False)

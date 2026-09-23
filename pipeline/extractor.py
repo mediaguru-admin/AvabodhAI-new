@@ -187,6 +187,52 @@ class ExtractedDocument:
     page_count: int = 0
     image_elements: list[Any] = field(default_factory=list)   # "Image"-category elements (PDF only) — fed to image_processor.py::extract_images_from_elements()
     table_elements: list[Any] = field(default_factory=list)   # "Table"-category elements (PDF only) — fed to image_processor.py::extract_images_from_elements()
+    # PDF only: {1-indexed page_number: extractable text-layer character
+    # count}. A page with a real text layer yields hundreds-to-thousands of
+    # chars; a page whose content is drawn as vector paths or is a scanned
+    # raster yields ~0, meaning ANYTHING unstructured extracted from it came
+    # from OCR. Consumed by pipeline/ingest.py to decide whether a Table
+    # element's text_as_html can be trusted — see _pdf_page_text_chars().
+    page_text_chars: dict[int, int] = field(default_factory=dict)
+
+
+def _pdf_page_text_chars(filepath: str) -> dict[int, int]:
+    """
+    Per-page extractable-text character count, 1-indexed to match
+    unstructured's metadata.page_number.
+
+    2026-09-23 — added after a confirmed live failure: the Godrej Q2 FY26
+    annexure pages render their tables as VECTOR DRAWINGS with the cell
+    text converted to outlines, so the pages carry ~77 text characters
+    each (just the slide header/footer) against 300-475 drawing ops. No
+    text layer means unstructured's hi_res path can only OCR them, and OCR
+    of a dense 23-row numeric table silently dropped most rows while still
+    emitting a structurally clean 12-column <table> — so the result LOOKED
+    well-formed and passed every structural sanity check, but was missing
+    the data. Chat then answered "21.79 million sq ft" for a figure whose
+    real value is 34.01, with no error logged anywhere.
+
+    The garbling itself turned out to be undetectable downstream (those
+    tables score uniform=1.0 on cell-count consistency and have a LOWER
+    junk-character ratio than several perfectly good tables in the same
+    document — measured, not assumed). The text layer is the honest
+    upstream signal instead: it says whether OCR was even involved.
+
+    Returns {} on any failure — callers treat an absent entry as "unknown,
+    assume fine", so this can never make extraction fail.
+    """
+    try:
+        import pymupdf
+    except ImportError:  # pragma: no cover - pymupdf is a declared dependency
+        logger.warning("pymupdf unavailable — skipping text-layer measurement for '%s'", filepath)
+        return {}
+
+    try:
+        with pymupdf.open(filepath) as doc:
+            return {i + 1: len(page.get_text().strip()) for i, page in enumerate(doc)}
+    except Exception as e:
+        logger.warning("Text-layer measurement failed for '%s' (non-fatal): %s", filepath, e)
+        return {}
 
 
 def _compute_file_hash(filepath: str) -> str:
@@ -251,7 +297,8 @@ def extract_file(filepath: str) -> ExtractedDocument:
         source_path=os.path.abspath(filepath),
         page_count=len(page_numbers) or 1,
         image_elements=image_elements,
-        table_elements=table_elements
+        table_elements=table_elements,
+        page_text_chars=_pdf_page_text_chars(filepath) if ext == ".pdf" else {},
     )
 
 

@@ -143,6 +143,32 @@ def _bootstrap_rls(conn) -> None:
     logger.info("Row-Level Security enabled + forced on: %s", ", ".join(_ISOLATED_TABLES))
 
 
+def _bootstrap_chat_memory_columns(conn) -> None:
+    """
+    create_all() only creates tables that don't exist yet — it cannot ALTER
+    an existing chat_threads table to add the rolling-summary columns
+    (db/models.py::ChatThread.rolling_summary / rolling_summary_through,
+    added for pipeline/memory.py's rolling-summary conversation memory).
+    IF NOT EXISTS makes this idempotent, matching the rest of init_db().
+    """
+    conn.execute(text("ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS rolling_summary TEXT"))
+    conn.execute(text(
+        "ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS rolling_summary_through INTEGER NOT NULL DEFAULT 0"
+    ))
+
+
+def _bootstrap_chat_degraded_column(conn) -> None:
+    """
+    Same reason/pattern as _bootstrap_chat_memory_columns() above — adds
+    db/models.py::ChatMessage.degraded to an already-existing chat_messages
+    table. Internal-only (see that column's docstring): which retrieval
+    components silently fell back for a given turn, so a bad answer can be
+    explained after the fact without re-running anything. Never exposed on
+    ChatMessageResponse or any other API surface.
+    """
+    conn.execute(text("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS degraded JSON"))
+
+
 def init_db() -> None:
     """
     Schema bootstrap — runs on every app startup, using the ADMIN engine
@@ -160,6 +186,8 @@ def init_db() -> None:
         logger.info("Database tables verified / created successfully.")
 
         with _admin_engine.begin() as conn:
+            _bootstrap_chat_memory_columns(conn)
+            _bootstrap_chat_degraded_column(conn)
             _bootstrap_app_role(conn)
             _bootstrap_rls(conn)
 

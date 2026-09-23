@@ -156,6 +156,12 @@ def _build_llm(max_tokens: int) -> ChatOpenAI:
         model=settings.MAP_MODEL,
         temperature=settings.LLM_TEMPERATURE,
         max_tokens=max_tokens,
+        # See pipeline/chat.py::_build_llm — these settings existed but were
+        # wired to nothing, so every OpenAI call was unbounded. Matters most
+        # here: the Map step fans out one call per chunk in a thread pool, so
+        # one hung call held a worker for as long as the network let it.
+        timeout=settings.LLM_REQUEST_TIMEOUT,
+        max_retries=settings.LLM_MAX_RETRIES,
     )
 
 
@@ -283,23 +289,52 @@ def summarise_document(chunks: list[Document], doc_name: str = "document") -> di
 
     reduce_chain = COMBINE_PROMPT | reduce_llm | StrOutputParser()
 
-    try:
-        final_summary = reduce_chain.invoke({"text": combined}).strip()
+    # The Map step above already paid for and produced real data (one
+    # billed LLM call per chunk) — a single flaky Reduce call must never
+    # throw that away. Retry a couple of times first (most Reduce
+    # failures are transient: rate limits, timeouts), and if it's still
+    # failing, fall back to the chunk summaries directly rather than
+    # raising and losing the Map results entirely (the old behavior:
+    # raise here -> caller catches it -> summary_text stored as "",
+    # silently discarding every chunk-level call that already succeeded).
+    REDUCE_MAX_ATTEMPTS = 3
+    final_summary = None
+    reduce_fallback_used = False
+    last_reduce_error: Exception | None = None
 
-        # Deterministic safety net, not just a prompt instruction — collapse
-        # ANY run of whitespace (newlines, double spaces, tabs) into exactly
-        # one regular space. This is what actually guarantees a visible gap
-        # between "...State House." and "Key Findings:" — a plain space
-        # character survives essentially any frontend's text handling,
-        # where a raw newline is what was silently vanishing before (see
-        # the "KEY FINDINGS-President Tinubu" collision with zero space,
-        # confirmed in testing against Clariona's actual UI). Relying on
-        # the LLM to reliably include spacing on every single generation
-        # isn't a guarantee; this line is.
-        final_summary = re.sub(r"\s+", " ", final_summary).strip()
-    except Exception as e:
-        logger.error("Reduce step failed: %s", e)
-        raise RuntimeError(f"Reduce step failed: {e}")
+    for attempt in range(1, REDUCE_MAX_ATTEMPTS + 1):
+        try:
+            final_summary = reduce_chain.invoke({"text": combined}).strip()
+
+            # Deterministic safety net, not just a prompt instruction — collapse
+            # ANY run of whitespace (newlines, double spaces, tabs) into exactly
+            # one regular space. This is what actually guarantees a visible gap
+            # between "...State House." and "Key Findings:" — a plain space
+            # character survives essentially any frontend's text handling,
+            # where a raw newline is what was silently vanishing before (see
+            # the "KEY FINDINGS-President Tinubu" collision with zero space,
+            # confirmed in testing against Clariona's actual UI). Relying on
+            # the LLM to reliably include spacing on every single generation
+            # isn't a guarantee; this line is.
+            final_summary = re.sub(r"\s+", " ", final_summary).strip()
+            break
+        except Exception as e:
+            last_reduce_error = e
+            logger.warning(
+                "Reduce step attempt %d/%d failed for '%s': %s",
+                attempt, REDUCE_MAX_ATTEMPTS, doc_name, e,
+            )
+            if attempt < REDUCE_MAX_ATTEMPTS:
+                time.sleep(2 ** (attempt - 1))  # 1s, then 2s
+
+    if final_summary is None:
+        logger.error(
+            "Reduce step failed after %d attempts for '%s' (%s) — falling back to "
+            "joined chunk summaries instead of discarding the Map results",
+            REDUCE_MAX_ATTEMPTS, doc_name, last_reduce_error,
+        )
+        reduce_fallback_used = True
+        final_summary = re.sub(r"\s+", " ", " ".join(chunk_summaries)).strip()[:4000]
 
     # ── NEW — Step 5: Document-level metadata extraction (ONE extra call) ──
     document_metadata = None
@@ -325,11 +360,12 @@ def summarise_document(chunks: list[Document], doc_name: str = "document") -> di
     )
 
     return {
-        "summary_text":      final_summary,
-        "map_model":         settings.MAP_MODEL,
-        "reduce_model":      settings.REDUCE_MODEL,
-        "chunk_count":       len(chunks),
-        "elapsed_sec":       elapsed,
-        "chunk_metadata":    chunk_metadata,     # list aligned with final chunk order
-        "document_metadata": document_metadata,  # DocumentMetadataOutput | None
+        "summary_text":         final_summary,
+        "map_model":            settings.MAP_MODEL,
+        "reduce_model":         settings.REDUCE_MODEL,
+        "chunk_count":          len(chunks),
+        "elapsed_sec":          elapsed,
+        "chunk_metadata":       chunk_metadata,     # list aligned with final chunk order
+        "document_metadata":    document_metadata,  # DocumentMetadataOutput | None
+        "reduce_fallback_used": reduce_fallback_used,  # True if Reduce failed after retries and summary_text is the raw joined chunk summaries, not a real Reduce pass
     }
