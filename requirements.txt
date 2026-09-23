@@ -237,6 +237,9 @@ langchain-postgres==0.0.17
 # ── Testing ───────────────────────────────────────────────────────────────────
 pytest
 
+# Attribute definitions and extracted chunk attributes
+pymongo>=4.8,<5
+
 # ── Removed 2026-08-21 (Qdrant migration): pgvector, streamlit ──────────────
 # pgvector    -> DocumentChunk/pgvector dropped; chunk storage moves to Qdrant.
 #                Do not re-add unless Postgres regains a vector column.

@@ -16,6 +16,7 @@ class KBStatusResponse(BaseModel):
     kbDocumentId: UUID
     status: str
     error_message: Optional[str] = None
+    attributes: Dict[str, Any] = Field(default_factory=dict)
 
 
 class KBRetrieveRequest(BaseModel):

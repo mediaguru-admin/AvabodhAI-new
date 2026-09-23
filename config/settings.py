@@ -57,6 +57,9 @@ class Settings(BaseSettings):
 
     GROQ_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
+    # Optional OpenAI key used only by document attribute extraction. Keeping
+    # this separate preserves Ollama for chat, embeddings, and other local flows.
+    OPENAI_ATTRIBUTE_API_KEY: str = ""
     LLM_PROVIDER: str = "auto"
     PYTHON_KB_INTERNAL_URL: str = "http://localhost:8000"
 
@@ -93,6 +96,14 @@ class Settings(BaseSettings):
     QDRANT_API_KEY: str = ""   # optional — self-hosted Qdrant without auth is a valid local setup
     QDRANT_COLLECTION: str = "avabodh_chunks"
     QDRANT_CHAT_COLLECTION: str = "avabodh_chat_messages"
+
+    # ── Attribute extraction ─────────────────────────────────────────────
+    MONGODB_URL: str = "mongodb://localhost:27017"
+    MONGODB_DATABASE: str = "avabodh"
+    JEV_API_KEY: str = ""
+    JEV_API_URL: str = "https://api.typesafe.ai/v1/systemone"
+    JEV_TIMEOUT_SECONDS: int = 30
+    JEV_MIN_CONFIDENCE: float = 0.70
 
     # ── Sparse vectors + reranking (fastembed, ONNX — no torch needed) ─────
     SPARSE_MODEL: str = "prithivida/Splade_PP_en_v1"
@@ -402,6 +413,10 @@ class Settings(BaseSettings):
 
     @property
     def use_ollama(self) -> bool:
+        if self.LLM_PROVIDER.strip().lower() == "ollama":
+            return self._ollama_health(self.ollama_url)
+        if self.LLM_PROVIDER.strip().lower() == "openai":
+            return False
         if self.OPENAI_API_KEY:
             return False
         return self._ollama_health(self.ollama_url)

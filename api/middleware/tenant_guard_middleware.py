@@ -78,7 +78,9 @@ class TenantGuardMiddleware(BaseHTTPMiddleware):
             missing = []
             if not tenant_id:
                 missing.append("X-Tenant-ID")
-            if not org_unit_id:
+            # Attribute definitions support tenant-wide scope, so an
+            # organisation header is optional only for that route family.
+            if not org_unit_id and not path.startswith("/attributes"):
                 missing.append("X-Org-Unit-ID")
             if missing:
                 logger.warning("Rejected request missing %s: %s %s", missing, request.method, path)

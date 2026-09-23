@@ -1,4 +1,18 @@
 services:
+  mongodb:
+    image: mongo:7
+    container_name: avabodh_mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - avabodh_mongo_data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' | grep 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # Postgres is deliberately NOT a service here — it (and any vector DB)
   # must be a permanent instance living on its own local/host storage,
   # not something docker-compose creates and owns the lifecycle of. Point
@@ -10,12 +24,16 @@ services:
     image: apurbapm/avabodhai-api:latest
     container_name: avabodh_api
     restart: on-failure
+    depends_on:
+      mongodb:
+        condition: service_healthy
     ports:
       - "4000:8000"
       - "8000:8000"
     environment:
       LLM_PROVIDER:         ${LLM_PROVIDER:-auto}
       OPENAI_API_KEY:       ${OPENAI_API_KEY}
+      OPENAI_ATTRIBUTE_API_KEY: ${OPENAI_ATTRIBUTE_API_KEY:-}
       OLLAMA_BASE_URL:      ${OLLAMA_DOCKER_BASE_URL:-http://host.docker.internal:11434}
       OLLAMA_CHAT_MODEL:    ${OLLAMA_CHAT_MODEL:-qwen2.5:1.5b}
       OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
@@ -51,6 +69,12 @@ services:
       QDRANT_API_KEY:       ${QDRANT_API_KEY:-}
       QDRANT_COLLECTION:        ${QDRANT_COLLECTION:-avabodh_chunks}
       QDRANT_CHAT_COLLECTION:   ${QDRANT_CHAT_COLLECTION:-avabodh_chat_messages}
+      MONGODB_URL:          ${MONGODB_URL:-mongodb://mongodb:27017}
+      MONGODB_DATABASE:     ${MONGODB_DATABASE:-avabodh}
+      JEV_API_KEY:          ${JEV_API_KEY:-}
+      JEV_API_URL:          ${JEV_API_URL:-https://api.typesafe.ai/v1/systemone}
+      JEV_TIMEOUT_SECONDS:  ${JEV_TIMEOUT_SECONDS:-30}
+      JEV_MIN_CONFIDENCE:   ${JEV_MIN_CONFIDENCE:-0.70}
       SPARSE_MODEL:         ${SPARSE_MODEL:-prithivida/Splade_PP_en_v1}
       RERANK_MODEL:         ${RERANK_MODEL:-BAAI/bge-reranker-base}
       SEARCH_CANDIDATES:    ${SEARCH_CANDIDATES:-50}
@@ -130,6 +154,7 @@ services:
       disable: true
 
 volumes:
+  avabodh_mongo_data:
   uploaded_files:
   visual_crops:
   kb_uploaded_files:

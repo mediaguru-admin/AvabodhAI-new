@@ -22,7 +22,7 @@ from typing import Optional
 
 from langchain_core.documents import Document as LCDocument
 
-from pipeline import extractor, chunker, embedder, vector_store, storage, summariser, object_store
+from pipeline import extractor, chunker, embedder, vector_store, storage, summariser, object_store, attribute_store
 from pipeline.image_processor import (
     extract_images_from_elements, extract_images_from_soup,
     caption_image_with_vision, build_image_embedding_text, compute_image_hash,
@@ -279,6 +279,13 @@ def process_document(
             raise RuntimeError("No meaningful content extracted from this document")
 
         if chunks:
+            # Attribute extraction is intentionally best-effort and no-op when
+            # the tenant/organisation has no active definitions or Jev key.
+            # It runs before vector indexing so every stored record references
+            # the deterministic Qdrant chunk point id.
+            attribute_store.extract_and_store_chunks(
+                chunks, tenant_id, org_unit_id or None, str(document_id)
+            )
             _index_text_chunks(
                 chunks, str(document_id), tenant_id, org_unit_id, doc_hash, doc_name,
                 is_ground_truth, extracted.source_path, metadata,

@@ -15,6 +15,7 @@ except ImportError:  # Raised with a clear message only if local mode is used.
     ChatOllama = None
     OllamaEmbeddings = None
 from langchain_experimental.text_splitter import SemanticChunker
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_postgres.v2.engine import PGEngine
 from langchain_postgres.v2.vectorstores import PGVectorStore
 from langchain_core.prompts import PromptTemplate
@@ -48,6 +49,7 @@ class ConversationBufferWindowMemory:
 from config.settings import get_settings
 from db.models import KBDocument, KBChatHistory
 from pipeline.loader import load_single_document
+from pipeline.attribute_store import extract_and_store_chunks
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -99,6 +101,14 @@ async def ingest_document(file_path: str, owner_id: str, document_id: str, db: A
 
         # Split documents
         chunks = text_splitter.split_documents(docs)
+        # Keep long semantic sections bounded so attribute extraction sees
+        # each group of facts (rather than asking one model call to summarize
+        # an entire multi-section document).
+        bounded_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        bounded_chunks = []
+        for chunk in chunks:
+            bounded_chunks.extend(bounded_splitter.split_documents([chunk]) if len(chunk.page_content) > 1200 else [chunk])
+        chunks = bounded_chunks
 
         source_path = Path(file_path).as_posix()
         file_name = Path(file_path).name
@@ -112,7 +122,11 @@ async def ingest_document(file_path: str, owner_id: str, document_id: str, db: A
         )
 
         # Inject metadata for tenant isolation
-        for chunk in chunks:
+        for index, chunk in enumerate(chunks):
+            # SemanticChunker returns LangChain Documents without a guaranteed
+            # chunk_index attribute; keep a stable index in metadata for both
+            # vector citations and attribute extraction.
+            chunk.metadata["chunk_index"] = index
             chunk.metadata["owner_id"] = owner_id
             chunk.metadata["document_id"] = document_id
             chunk.metadata["doc_name"] = doc_name
@@ -135,6 +149,9 @@ async def ingest_document(file_path: str, owner_id: str, document_id: str, db: A
 
         # Add to vector store
         await vector_store.aadd_documents(chunks)
+
+        # Attribute extraction is best-effort and never blocks document readiness.
+        extract_and_store_chunks(chunks, owner_id, None, document_id)
 
         # Update document state to ready
         stmt = select(KBDocument).filter_by(id=uuid.UUID(document_id))

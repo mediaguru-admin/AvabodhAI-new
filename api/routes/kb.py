@@ -19,6 +19,8 @@ from api.schemas.kb_schemas import (
 from db.database import get_async_db_session_fastapi, AsyncSessionFactory
 from db.models import KBDocument
 from pipeline.kb_pipeline import ingest_document, retrieve_relevant_context, chat_with_kb
+from pipeline.attribute_store import get_document_attributes, upsert_definition
+import json
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -64,6 +66,7 @@ async def upload_kb_document(
     owner_id: str = Form(...),
     category: Optional[str] = Form(None),
     metadata: Optional[str] = Form(None),
+    active_attributes: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_async_db_session_fastapi)
 ):
     # 1. Create a unique document ID
@@ -91,6 +94,15 @@ async def upload_kb_document(
     db.add(kb_doc)
     await db.commit()
 
+    # NestJS sends active extraction definitions as upload metadata.
+    try:
+        definitions = json.loads(active_attributes or "[]")
+        for definition in definitions if isinstance(definitions, list) else []:
+            if definition.get("key") and definition.get("description"):
+                upsert_definition(owner_id, None, definition)
+    except Exception:
+        logger.exception("Could not save active attribute definitions")
+
     # 4. Dispatch background task
     background_tasks.add_task(bg_ingestion_wrapper, temp_path, owner_id, str(doc_id))
 
@@ -116,7 +128,8 @@ async def get_kb_document_status(
     return KBStatusResponse(
         kbDocumentId=kb_doc.id,
         status=kb_doc.status,
-        error_message=kb_doc.error_message
+        error_message=kb_doc.error_message,
+        attributes=get_document_attributes(str(kb_doc.owner_id), None, str(kb_doc.id)) if kb_doc.status == "ready" else {},
     )
 
 

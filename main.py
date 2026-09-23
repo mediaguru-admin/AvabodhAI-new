@@ -18,6 +18,7 @@ from api.routes import search
 from api.routes import chat
 from api.routes.web import router as web_router
 from api.routes import kb
+from api.routes import attributes
 from config.settings import get_settings
 
 logger = get_logger(__name__)
@@ -330,6 +331,7 @@ app.include_router(chat.router, prefix="/chat", tags=["Chat"])
 app.include_router(search.router, prefix="/search", tags=["Search"])
 app.include_router(web_router, prefix="/web", tags=["Web Scraping"])
 app.include_router(kb.router, prefix="/kb", tags=["Knowledge Base"])
+app.include_router(attributes.router, prefix="/attributes", tags=["Attributes"])
 
 
 @app.get("/", tags=["Root"])
