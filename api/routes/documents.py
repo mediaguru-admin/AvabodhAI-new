@@ -489,6 +489,7 @@ async def delete_document(
     # Postgres row (deterministic order: if Qdrant deletion fails, the
     # Postgres row still exists and the delete can be retried).
     vector_store.delete_document_points(tenant_id=tenant_id, document_id=str(doc_id))
+    vector_store.delete_document_summary(tenant_id=tenant_id, document_id=str(doc_id))
     if object_store.is_s3_uri(record.stored_path):
         object_store.delete(record.stored_path)          # non-fatal by design
     elif record.stored_path and os.path.exists(record.stored_path):

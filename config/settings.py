@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     # calls and the Qdrant `dense` vector size in vector_store.py.
     EMBEDDING_DIMENSIONS: int = 1536
     EMBEDDING_BATCH_SIZE: int = 100     # chunks per batch to OpenAI
+    # If a dense-embedding batch fails, retry it this many times (backoff
+    # below) before giving up. Exhausting retries stops the whole document
+    # rather than skipping the batch and continuing — a skipped batch means
+    # those chunks are just silently absent from the vector store with no
+    # indication anything is missing, which is worse than an explicit
+    # failure the user can retry.
+    EMBEDDING_MAX_RETRIES: int = 2
 
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_DOCKER_BASE_URL: str = "http://host.docker.internal:11434"
@@ -65,6 +72,15 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.0
     LLM_REQUEST_TIMEOUT: int = 120
     LLM_MAX_RETRIES: int = 3
+    # Chat answers are user-facing — somebody is watching a spinner — so
+    # they fail fast rather than using the ingestion budget above. With
+    # LLM_REQUEST_TIMEOUT=120 and LLM_MAX_RETRIES=3 a wedged endpoint could
+    # burn ~8 minutes before giving up, which reads as "broken" long before
+    # it reads as "slow". 45s x 1 retry caps a chat turn's LLM time at ~90s.
+    # Ingestion keeps the longer budget: it runs in the background where
+    # nobody is waiting, and a large document genuinely can take minutes.
+    CHAT_REQUEST_TIMEOUT: int = 45
+    CHAT_MAX_RETRIES: int = 1
 
     # ── Chunking ───────────────────────────────────────────────────────────
     # CHUNK_BREAKPOINT_THRESHOLD removed 2026-08-21 — was specific to the old
@@ -79,8 +95,47 @@ class Settings(BaseSettings):
     # chunks are untouched.
     CHUNK_OVERLAP: int = 200
 
+    # Below this many characters of extractable text on a PDF page, any
+    # table unstructured reports for that page must have come from OCR
+    # (the page is vector-drawn or scanned), so its text_as_html is not
+    # trusted and the table is routed to the GPT-4o Vision crop path
+    # instead — see pipeline/image_processor.py::table_html_is_reliable().
+    # 200 sits in a wide empirical gap: on the document that exposed this
+    # bug, vector-drawn annexure pages measured 76-94 chars while every
+    # text-layer page with a table measured 477+.
+    TABLE_TEXT_LAYER_MIN_CHARS: int = 200
+
     # ── Summary ────────────────────────────────────────────────────────────
     SUMMARY_LANGUAGE: str = "English"
+
+    # ── Chat conversation memory (pipeline/memory.py) ─────────────────────
+    # 2026-09-23: replaces the plain fixed-window-only memory. Three layers,
+    # combined — the standard production pattern (recency window + rolling
+    # summary + semantic recall over the full history), not a knowledge
+    # graph: a graph is the right tool for tracking entities/relationships
+    # across sessions, not for "what did we just discuss in this thread."
+    #   1. Recency window (MEMORY_WINDOW_SIZE turns, unchanged) — last N
+    #      turns sent verbatim, for immediate coherence.
+    #   2. Rolling summary (ChatThread.rolling_summary, db/models.py) —
+    #      every turn that ages OUT of the window gets folded into a
+    #      running summary instead of being dropped, so a long thread's
+    #      earlier topics are never silently forgotten, without resending
+    #      the whole transcript every request. Reuses the same
+    #      MAP_MODEL/REDUCE_MODEL LLM plumbing as document summarisation.
+    #   3. Semantic recall — the current query is embedded and matched
+    #      against every past message in this thread (already indexed in
+    #      Qdrant's avabodh_chat_messages collection for GET /chat/search,
+    #      pipeline/chat_storage.py::_index_message_in_qdrant), so a
+    #      specific fact from turn 3 can resurface on turn 40 even though
+    #      it long ago fell out of both the window and the summary's level
+    #      of detail.
+    # How many turns (1 turn = 1 human + 1 AI message) stay verbatim in the
+    # recency window before aging out into the rolling summary. Moved here
+    # from a hardcoded pipeline/memory.py constant so it's tunable per
+    # deployment without a code change.
+    MEMORY_WINDOW_SIZE: int = 5
+    MEMORY_SEMANTIC_RECALL_LIMIT: int = 4
+    MEMORY_SUMMARY_MAX_TOKENS: int = 400
 
     # ── Qdrant (vector search) ────────────────────────────────────────────
     # Self-hosted, on-prem Qdrant instance — NOT Docker-managed by this
@@ -93,6 +148,41 @@ class Settings(BaseSettings):
     QDRANT_API_KEY: str = ""   # optional — self-hosted Qdrant without auth is a valid local setup
     QDRANT_COLLECTION: str = "avabodh_chunks"
     QDRANT_CHAT_COLLECTION: str = "avabodh_chat_messages"
+    # One point per document (its summary, embedded once at ingestion) —
+    # backs the document-shortlist stage in pipeline/retriever.py so a
+    # query first narrows to DOC_SHORTLIST_LIMIT relevant documents before
+    # chunk-level search runs inside just those, instead of every query
+    # competing across the whole corpus's chunks regardless of how many
+    # documents exist. Keeps retrieval quality from degrading as the
+    # knowledge base grows past a handful of documents.
+    QDRANT_DOC_SUMMARY_COLLECTION: str = "avabodh_document_summaries"
+    # If a chunk-upsert batch fails, retry it this many times (backoff
+    # below) before declaring the whole upload/document failed.
+    QDRANT_UPSERT_MAX_RETRIES: int = 5
+    # How many documents the shortlist stage narrows to before chunk-level
+    # search runs. Only used when the caller hasn't already scoped the
+    # query to a specific document/set of documents.
+    DOC_SHORTLIST_LIMIT: int = 5
+    # MMR (Maximal Marginal Relevance) diversity weight for the final
+    # chunk selection: 1.0 = pure relevance (no diversity penalty, old
+    # behavior), 0.0 = pure diversity (ignores relevance).
+    # 2026-09-23: started at 0.5 (equal weighting), raised to 0.85, then
+    # to 1.0 — confirmed live that even a small diversity weight (0.15)
+    # was enough to make chat answers give wrong values on a precision-
+    # sensitive question, on the same day this was introduced. 1.0 makes
+    # _mmr_select() mathematically identical to plain top-K-by-relevance
+    # (the pre-MMR behavior) — diversity re-ranking is fully OFF by
+    # default now. The system prompt (pipeline/memory.py) demands exact,
+    # non-approximate figures; that is fundamentally in tension with
+    # optimizing for diversity, which can deprioritize the one chunk with
+    # the precise number in favor of a topically-different-but-less-exact
+    # one. shortlist_documents() above already solves the cross-document
+    # dilution problem MMR was partly meant to help with, so there's very
+    # little upside left to offset that risk. Only lower this from 1.0 if
+    # you specifically need broader-coverage answers, you've confirmed the
+    # documents/queries in play aren't precision-sensitive, and you test
+    # the change against real numeric-lookup questions before trusting it.
+    MMR_LAMBDA: float = 1.0
 
     # ── Sparse vectors + reranking (fastembed, ONNX — no torch needed) ─────
     SPARSE_MODEL: str = "prithivida/Splade_PP_en_v1"
@@ -163,6 +253,15 @@ class Settings(BaseSettings):
     # several visual chunks for one question. Bounded here rather than
     # left to top_k so cost/latency stay predictable.
     MAX_ATTACHED_CROPS: int = 6
+
+    # How many sources are returned to the caller per chat answer.
+    # Retrieval/reranking still uses the full request.top_k for what the
+    # LLM answers FROM — this only trims the CITATION LIST shown to the
+    # user afterward (chunks are already relevance-sorted, so this is a
+    # top-N slice, not an arbitrary one). Kept separate from top_k because
+    # a longer answer can legitimately draw on more context than is useful
+    # to show as a citation list.
+    MAX_SOURCES_RETURNED: int = 3
 
     # ── Content extraction (unstructured) ───────────────────────────────────
     # "hi_res" runs the layout-detection model + OCR fallback (accurate,
@@ -262,6 +361,24 @@ class Settings(BaseSettings):
     FILE_LINK_TTL_SECONDS: Optional[int] = None
     PUBLIC_BASE_URL: str = ""
 
+    # ── Core webhook (ingestion status push) ────────────────────────────────
+    # Optional. When set, pipeline/webhook.py posts a status ping to Core the
+    # moment a document reaches PROCESSING/READY/FAILED, instead of Core only
+    # finding out on its next poll (api/routes/documents.py already reports
+    # status synchronously on every GET, so this is purely a push-vs-pull
+    # latency improvement, not a new source of truth). Left blank, nothing
+    # changes — Core's existing poll loop is untouched and remains the
+    # fallback if a ping is ever lost, so this is safe to leave unset.
+    CORE_WEBHOOK_URL: str = ""
+    # Shared secret sent as the X-Webhook-Secret header on every ping, so
+    # Core can trust it actually came from this Avabodh instance. Must match
+    # whatever Core's own webhook-receiving endpoint is configured to expect.
+    CORE_WEBHOOK_SECRET: str = ""
+    # Per-call timeout for the webhook POST — kept short deliberately. This
+    # call happens inside the ingestion background task; a slow/hung Core
+    # endpoint must never be able to stall ingestion itself.
+    CORE_WEBHOOK_TIMEOUT_SECONDS: float = 5.0
+
     LOG_LEVEL: str = "INFO"
     LOG_FILE: str = "avabodh.log"
 
@@ -294,6 +411,15 @@ class Settings(BaseSettings):
 
     def __init__(self, **data: Any):
         merged = self._load_env_file_data()
+        # Real process environment variables always win over the .env file
+        # — standard 12-factor precedence, and what lets a test fixture's
+        # monkeypatch.setenv (or a real deployment env var) override a
+        # value the checked-in .env also happens to define. Without this,
+        # any key present in .env was passed to super().__init__() as an
+        # explicit kwarg unconditionally, which silently shadowed the real
+        # environment for that key no matter what actually set it.
+        known = set(type(self).model_fields)
+        merged.update({k: v for k, v in os.environ.items() if k in known})
         merged.update(data)
 
         # Drop keys this class doesn't declare BEFORE pydantic sees them.
@@ -309,7 +435,6 @@ class Settings(BaseSettings):
         # Ignoring unknown keys also matches how real environment variables
         # already behave here: the OS environment is full of unrelated
         # variables and none of them have ever been an error.
-        known = set(type(self).model_fields)
         dropped = [k for k in merged if k not in known]
         merged = {k: v for k, v in merged.items() if k in known}
 
@@ -352,10 +477,14 @@ class Settings(BaseSettings):
         "DB_POOL_TIMEOUT",
         "EMBEDDING_DIMENSIONS",
         "EMBEDDING_BATCH_SIZE",
+        "EMBEDDING_MAX_RETRIES",
+        "QDRANT_UPSERT_MAX_RETRIES",
         "MAP_MAX_TOKENS",
         "REDUCE_MAX_TOKENS",
         "LLM_REQUEST_TIMEOUT",
         "LLM_MAX_RETRIES",
+        "CHAT_REQUEST_TIMEOUT",
+        "CHAT_MAX_RETRIES",
         "MAX_CHUNK_SIZE",
         "MIN_CHUNK_SIZE",
         "CHUNK_OVERLAP",
@@ -367,8 +496,15 @@ class Settings(BaseSettings):
         "SEARCH_CANDIDATES_MAX",
         "SEARCH_SCORE_THRESHOLD",
         "MAX_ATTACHED_CROPS",
+        "MAX_SOURCES_RETURNED",
         "STORAGE_LOCAL_TTL_HOURS",
         "MAX_IMAGES_PER_DOCUMENT",
+        "DOC_SHORTLIST_LIMIT",
+        "MMR_LAMBDA",
+        "MEMORY_WINDOW_SIZE",
+        "MEMORY_SEMANTIC_RECALL_LIMIT",
+        "MEMORY_SUMMARY_MAX_TOKENS",
+        "TABLE_TEXT_LAYER_MIN_CHARS",
         mode="before",
     )
     @classmethod

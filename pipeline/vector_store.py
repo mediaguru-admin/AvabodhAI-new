@@ -30,6 +30,7 @@ creating duplicates. See IMPLEMENTATION_PLAN (2).md §2.2 / architecture
 doc §26.
 """
 
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional, Union
@@ -50,14 +51,42 @@ DENSE_VECTOR_NAME = "dense"
 SPARSE_VECTOR_NAME = "splade"
 
 
+_CLIENT_CACHE: dict[tuple[str, Optional[str]], QdrantClient] = {}
+
+
 def _client() -> QdrantClient:
     """
-    Module-singleton-ish client. Not cached in a global on purpose — the
-    qdrant-client library itself pools connections internally, and a
-    plain function call here keeps this trivially mockable/patchable in
-    tests (tests point QDRANT_URL at QdrantClient(":memory:") instead).
+    Cached per (url, api_key).
+
+    2026-09-23 — this used to build a NEW QdrantClient on every call. The
+    old docstring justified that with "the library pools connections
+    internally", which is true but misses the point: that pool lives
+    INSIDE a client instance, so a fresh client per call means a fresh
+    connection pool per call. Worse, qdrant-client performs a server
+    version-compatibility check when it is constructed, so every single
+    operation paid an extra HTTP round trip before its real request (this
+    is the source of the recurring "Failed to obtain server version"
+    warning). Measured cost: count_document_summaries() 2.35s and search()
+    1.10s against a local Qdrant holding a few hundred points — almost all
+    of it connection setup, not query work.
+
+    Keyed on (url, api_key) rather than a bare global so that changing
+    QDRANT_URL (which tests do, pointing at ":memory:") still yields a
+    different client instead of silently reusing the wrong one. Tests that
+    patch this function wholesale (patch.object(vector_store, "_client"))
+    are unaffected either way.
+
+    check_compatibility=False skips the version handshake — with the client
+    cached it would only happen once per process, but it is pure overhead
+    against a Qdrant we control the version of, and it is what emits the
+    warning above.
     """
-    return QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY or None)
+    key = (settings.QDRANT_URL, settings.QDRANT_API_KEY or None)
+    client = _CLIENT_CACHE.get(key)
+    if client is None:
+        client = QdrantClient(url=key[0], api_key=key[1], check_compatibility=False)
+        _CLIENT_CACHE[key] = client
+    return client
 
 
 def chunk_point_id(document_id: str, role: str, chunk_index: int) -> str:
@@ -72,14 +101,15 @@ def chunk_point_id(document_id: str, role: str, chunk_index: int) -> str:
 
 def ensure_collections() -> None:
     """
-    Create avabodh_chunks / avabodh_chat_messages (+ payload indexes) if
-    they don't already exist. Safe to call on every startup — Qdrant's
-    create_collection is not idempotent by itself (raises if it already
-    exists), so existence is checked first.
+    Create avabodh_chunks / avabodh_chat_messages / avabodh_document_summaries
+    (+ payload indexes) if they don't already exist. Safe to call on every
+    startup — Qdrant's create_collection is not idempotent by itself
+    (raises if it already exists), so existence is checked first.
     """
     client = _client()
     _ensure_chunks_collection(client)
     _ensure_chat_collection(client)
+    _ensure_document_summary_collection(client)
 
 
 def _ensure_chunks_collection(client: QdrantClient) -> None:
@@ -134,6 +164,36 @@ def _ensure_chat_collection(client: QdrantClient) -> None:
     _ensure_payload_index(client, settings.QDRANT_CHAT_COLLECTION, "tenant_id", models.KeywordIndexParams(type="keyword", is_tenant=True))
     _ensure_payload_index(client, settings.QDRANT_CHAT_COLLECTION, "org_unit_id", models.PayloadSchemaType.KEYWORD)
     _ensure_payload_index(client, settings.QDRANT_CHAT_COLLECTION, "thread_id", models.PayloadSchemaType.KEYWORD)
+
+
+def _ensure_document_summary_collection(client: QdrantClient) -> None:
+    """
+    One point per document (see upsert_document_summary()) — backs the
+    document-shortlist stage in pipeline/retriever.py::shortlist_documents().
+    Same dense+sparse hybrid shape as avabodh_chunks, so shortlisting can
+    reuse the exact same fused RRF search semantics, just against document
+    summaries instead of chunks.
+    """
+    if not client.collection_exists(settings.QDRANT_DOC_SUMMARY_COLLECTION):
+        client.create_collection(
+            collection_name=settings.QDRANT_DOC_SUMMARY_COLLECTION,
+            vectors_config={
+                DENSE_VECTOR_NAME: models.VectorParams(
+                    size=settings.EMBEDDING_DIMENSIONS,
+                    distance=models.Distance.COSINE,
+                ),
+            },
+            sparse_vectors_config={
+                SPARSE_VECTOR_NAME: models.SparseVectorParams(
+                    modifier=models.Modifier.IDF,
+                ),
+            },
+        )
+        logger.info("Created Qdrant collection '%s'.", settings.QDRANT_DOC_SUMMARY_COLLECTION)
+
+    _ensure_payload_index(client, settings.QDRANT_DOC_SUMMARY_COLLECTION, "tenant_id", models.KeywordIndexParams(type="keyword", is_tenant=True))
+    _ensure_payload_index(client, settings.QDRANT_DOC_SUMMARY_COLLECTION, "org_unit_id", models.PayloadSchemaType.KEYWORD)
+    _ensure_payload_index(client, settings.QDRANT_DOC_SUMMARY_COLLECTION, "document_id", models.PayloadSchemaType.KEYWORD)
 
 
 def _ensure_payload_index(client: QdrantClient, collection: str, field_name: str, schema) -> None:
@@ -228,14 +288,43 @@ class ChunkPoint:
 
 
 def upsert_chunks(points: list[ChunkPoint], batch_size: int = 100) -> int:
-    """Batched upsert — idempotent (deterministic point IDs, see chunk_point_id())."""
+    """
+    Batched upsert — idempotent (deterministic point IDs, see
+    chunk_point_id()), which is exactly what makes retrying here safe: a
+    retried upsert overwrites the same points rather than duplicating them.
+
+    Each batch gets settings.QDRANT_UPSERT_MAX_RETRIES retries (a transient
+    Qdrant blip must not fail a whole document — chunking, embedding, and
+    everything before this call already happened and was paid for) before
+    the whole upload is declared failed.
+    """
     if not points:
         return 0
+    max_retries = max(0, settings.QDRANT_UPSERT_MAX_RETRIES)
     client = _client()
     total = 0
+    total_batches = (len(points) + batch_size - 1) // batch_size
     for i in range(0, len(points), batch_size):
+        batch_num = (i // batch_size) + 1
         batch = [p.to_point() for p in points[i : i + batch_size]]
-        client.upsert(collection_name=settings.QDRANT_COLLECTION, points=batch)
+        last_error: Exception | None = None
+        for attempt in range(1, max_retries + 2):
+            try:
+                client.upsert(collection_name=settings.QDRANT_COLLECTION, points=batch)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "Qdrant upsert batch %d/%d failed (attempt %d/%d): %s",
+                    batch_num, total_batches, attempt, max_retries + 1, e,
+                )
+                if attempt <= max_retries:
+                    time.sleep(2 ** (attempt - 1))  # 1s, 2s, 4s, ...
+        if last_error is not None:
+            raise RuntimeError(
+                f"Qdrant upsert failed at batch {batch_num} after {max_retries + 1} attempt(s): {last_error}"
+            ) from last_error
         total += len(batch)
     logger.info("Upserted %d chunk point(s) into '%s'.", total, settings.QDRANT_COLLECTION)
     return total
@@ -282,6 +371,26 @@ def count_chunks(query_filter: models.Filter) -> int:
     return result.count
 
 
+def count_document_summaries(query_filter: models.Filter) -> int:
+    """
+    Cheap filtered count (no vector search) over the document-summary
+    collection — same purpose as count_chunks() above, for
+    pipeline/retriever.py::shortlist_documents(): only actually narrow to
+    DOC_SHORTLIST_LIMIT documents when the tenant/org genuinely HAS more
+    documents than that. A knowledge base with 10 documents and a
+    DOC_SHORTLIST_LIMIT of 5 must not silently exclude half of it from
+    every unscoped query — that's not narrowing to "the relevant
+    documents," that's just dropping real, indexed content.
+    """
+    client = _client()
+    result = client.count(
+        collection_name=settings.QDRANT_DOC_SUMMARY_COLLECTION,
+        count_filter=query_filter,
+        exact=False,
+    )
+    return result.count
+
+
 def delete_document_points(tenant_id: str, document_id: str) -> None:
     """
     Delete every chunk (text + image) belonging to one document, in one
@@ -300,6 +409,120 @@ def delete_document_points(tenant_id: str, document_id: str) -> None:
         ),
     )
     logger.info("Deleted Qdrant points for document_id=%s (tenant=%s).", document_id, tenant_id)
+
+
+def document_summary_point_id(document_id: str) -> str:
+    """Deterministic point ID (like chunk_point_id()) — re-ingesting/
+    reprocessing the same document overwrites its one summary point
+    instead of creating a duplicate."""
+    return str(uuid.uuid5(_POINT_NS, f"docsummary:{document_id}"))
+
+
+def upsert_document_summary(
+    document_id: str,
+    tenant_id: str,
+    org_unit_id: str,
+    doc_name: str,
+    summary_text: str,
+    dense_vector: list[float],
+    sparse_indices: list[int],
+    sparse_values: list[float],
+) -> None:
+    """
+    One point per document, embedding its summary — backs the
+    shortlist-documents-first stage in pipeline/retriever.py. Same retry
+    treatment as upsert_chunks(): a transient Qdrant blip here must not
+    fail the whole document when chunk indexing already succeeded (this
+    runs after chunks are already upserted — see pipeline/ingest.py).
+    """
+    if not summary_text.strip():
+        return
+    max_retries = max(0, settings.QDRANT_UPSERT_MAX_RETRIES)
+    client = _client()
+    point = models.PointStruct(
+        id=document_summary_point_id(document_id),
+        vector={
+            DENSE_VECTOR_NAME: dense_vector,
+            SPARSE_VECTOR_NAME: models.SparseVector(indices=sparse_indices, values=sparse_values),
+        },
+        payload={
+            "tenant_id": tenant_id,
+            "org_unit_id": org_unit_id,
+            "document_id": document_id,
+            "doc_name": doc_name,
+            "summary_text": summary_text,
+        },
+    )
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 2):
+        try:
+            client.upsert(collection_name=settings.QDRANT_DOC_SUMMARY_COLLECTION, points=[point])
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "Document-summary upsert failed for document_id=%s (attempt %d/%d): %s",
+                document_id, attempt, max_retries + 1, e,
+            )
+            if attempt <= max_retries:
+                time.sleep(2 ** (attempt - 1))
+    if last_error is not None:
+        # Deliberately non-fatal — the shortlist stage falls back to an
+        # unscoped search when a document has no summary point (see
+        # shortlist_documents()), so losing this one document's shortlist
+        # entry degrades retrieval slightly, it doesn't break it. Chunk
+        # indexing (the retrieval-critical part) already succeeded by the
+        # time this runs and must not be undone by this failing.
+        logger.error(
+            "Document-summary upsert failed for document_id=%s after %d attempt(s) — "
+            "this document just won't be shortlisted first, chunk-level search still works: %s",
+            document_id, max_retries + 1, last_error,
+        )
+
+
+def delete_document_summary(tenant_id: str, document_id: str) -> None:
+    """Companion to delete_document_points() — must be called alongside
+    it wherever a document is deleted, or a stale shortlist entry outlives
+    the document it pointed at."""
+    client = _client()
+    client.delete(
+        collection_name=settings.QDRANT_DOC_SUMMARY_COLLECTION,
+        points_selector=models.FilterSelector(
+            filter=models.Filter(must=[
+                models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
+                models.FieldCondition(key="document_id", match=models.MatchValue(value=document_id)),
+            ])
+        ),
+    )
+
+
+def search_document_summaries(
+    query_filter: models.Filter,
+    dense_vector: list[float],
+    sparse_indices: list[int],
+    sparse_values: list[float],
+    limit: int,
+) -> list[dict]:
+    """Hybrid search over document summaries — same RRF fusion shape as
+    search() but against QDRANT_DOC_SUMMARY_COLLECTION. Returns dicts with
+    document_id, doc_name, and score."""
+    client = _client()
+    result = client.query_points(
+        collection_name=settings.QDRANT_DOC_SUMMARY_COLLECTION,
+        prefetch=[
+            models.Prefetch(query=dense_vector, using=DENSE_VECTOR_NAME, filter=query_filter, limit=limit),
+            models.Prefetch(
+                query=models.SparseVector(indices=sparse_indices, values=sparse_values),
+                using=SPARSE_VECTOR_NAME, filter=query_filter, limit=limit,
+            ),
+        ],
+        query=models.FusionQuery(fusion=models.Fusion.RRF),
+        query_filter=query_filter,
+        limit=limit,
+        with_payload=True,
+    )
+    return [{"id": str(pt.id), "score": pt.score, **(pt.payload or {})} for pt in result.points]
 
 
 def scroll_document_chunks(
@@ -351,6 +574,7 @@ def search(
     score_threshold: Optional[float] = None,
     query_point_id: Optional[Union[str, int]] = None,
     lookup_from_collection: Optional[str] = None,
+    with_vectors: bool = False,
 ) -> list[dict]:
     """
     mode: "hybrid" (dense + sparse prefetch, fused server-side via RRF),
@@ -377,6 +601,13 @@ def search(
     only one query source (a fresh vector, or an existing point) applies
     per call.
 
+    with_vectors: when True, also returns each hit's dense vector under
+    "_dense_vector" — needed for MMR diversity re-ranking
+    (pipeline/retriever.py::_mmr_select()), which requires the actual
+    embeddings to measure similarity between candidates, not just their
+    scores. False by default since most callers don't need it and it adds
+    real payload size.
+
     Returns dicts with `id`, `score`, and the point's payload merged in —
     same shape regardless of mode, so callers don't need to branch.
     """
@@ -397,6 +628,7 @@ def search(
             score_threshold=threshold,
             lookup_from=lookup_from,
             with_payload=True,
+            with_vectors=with_vectors,
         )
     elif mode == "keyword":
         query_value = query_point_id
@@ -413,6 +645,7 @@ def search(
             score_threshold=threshold,
             lookup_from=lookup_from,
             with_payload=True,
+            with_vectors=with_vectors,
         )
     else:  # hybrid
         dense_query = query_point_id if query_point_id is not None else dense_vector
@@ -450,11 +683,32 @@ def search(
             query=models.FusionQuery(fusion=models.Fusion.RRF),
             query_filter=query_filter,
             limit=limit,
-            score_threshold=threshold,
+            # 2026-09-23: deliberately NOT score_threshold=threshold here.
+            # An RRF score is derived from a hit's RANK in each leg
+            # (~1/(k+rank)), not from how relevant it is — the same score
+            # means "was near the top of its list", whether that list was
+            # full of good matches or bad ones. Thresholding it filters by
+            # position, not by relevance, and it measurably does the wrong
+            # thing: in a live trace of a real query, a page-footnote
+            # fragment cleared this cutoff at 0.4167 while the
+            # cross-encoder scored it -1.77 (i.e. correctly identified it
+            # as irrelevant). The reranker is the calibrated relevance
+            # judge; let it do the filtering. The dense/sparse branches
+            # above DO keep the threshold, because there it applies to a
+            # real cosine similarity, which is a genuine relevance measure.
             with_payload=True,
+            with_vectors=with_vectors,
         )
 
-    return [{"id": str(pt.id), "score": pt.score, **(pt.payload or {})} for pt in result.points]
+    out = []
+    for pt in result.points:
+        row = {"id": str(pt.id), "score": pt.score, **(pt.payload or {})}
+        if with_vectors and pt.vector:
+            dense = pt.vector.get(DENSE_VECTOR_NAME) if isinstance(pt.vector, dict) else None
+            if dense is not None:
+                row["_dense_vector"] = dense
+        out.append(row)
+    return out
 
 
 def batch_search(
@@ -462,7 +716,7 @@ def batch_search(
     dense_vectors: list[list[float]],
     sparse_vectors: list[tuple[list[int], list[float]]],
     limit: int = 10,
-    score_threshold: Optional[float] = None,
+    with_vectors: bool = False,
 ) -> list[list[dict]]:
     """
     Hybrid search for N queries in ONE network round trip via Qdrant's
@@ -488,7 +742,6 @@ def batch_search(
         return []
 
     client = _client()
-    threshold = score_threshold if score_threshold is not None else settings.SEARCH_SCORE_THRESHOLD
     requests = [
         models.QueryRequest(
             prefetch=[
@@ -511,17 +764,36 @@ def batch_search(
             query=models.FusionQuery(fusion=models.Fusion.RRF),
             filter=query_filter,
             limit=limit,
-            score_threshold=threshold,
+            # No score_threshold — same reasoning as the hybrid branch of
+            # search() above: this is an RRF-fused score, so a cutoff here
+            # filters by rank position rather than relevance. Reranking
+            # (pipeline/retriever.py) is the calibrated filter.
             with_payload=True,
+            # models.QueryRequest's field is with_vector (singular) — not
+            # with_vectors, which is what client.query_points() (used by
+            # search(), above) takes instead. Passing with_vectors here
+            # raised a pydantic "Extra inputs are not permitted" error,
+            # confirmed live: every multi-query (follow-up) chat turn was
+            # silently falling back to N sequential per-query searches
+            # instead of the intended single batched round trip.
+            with_vector=with_vectors,
         )
         for dense_vec, (sparse_idx, sparse_val) in zip(dense_vectors, sparse_vectors)
     ]
 
     responses = client.query_batch_points(collection_name=settings.QDRANT_COLLECTION, requests=requests)
-    return [
-        [{"id": str(pt.id), "score": pt.score, **(pt.payload or {})} for pt in resp.points]
-        for resp in responses
-    ]
+    out: list[list[dict]] = []
+    for resp in responses:
+        rows = []
+        for pt in resp.points:
+            row = {"id": str(pt.id), "score": pt.score, **(pt.payload or {})}
+            if with_vectors and pt.vector:
+                dense = pt.vector.get(DENSE_VECTOR_NAME) if isinstance(pt.vector, dict) else None
+                if dense is not None:
+                    row["_dense_vector"] = dense
+            rows.append(row)
+        out.append(rows)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -575,16 +847,26 @@ def search_chat(
     org_unit_id: str,
     dense_vector: list[float],
     top_k: int = 10,
+    thread_id: Optional[str] = None,
 ) -> list[dict]:
+    """
+    thread_id: optional — GET /chat/search (cross-thread history search)
+    leaves this None to search the whole tenant+org_unit. pipeline/memory.py's
+    semantic-recall layer passes it to scope recall to the current thread
+    only, so a follow-up question never pulls in an unrelated conversation.
+    """
+    must = [
+        models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
+        models.FieldCondition(key="org_unit_id", match=models.MatchValue(value=org_unit_id)),
+    ]
+    if thread_id:
+        must.append(models.FieldCondition(key="thread_id", match=models.MatchValue(value=thread_id)))
     client = _client()
     result = client.query_points(
         collection_name=settings.QDRANT_CHAT_COLLECTION,
         query=dense_vector,
         using=DENSE_VECTOR_NAME,
-        query_filter=models.Filter(must=[
-            models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
-            models.FieldCondition(key="org_unit_id", match=models.MatchValue(value=org_unit_id)),
-        ]),
+        query_filter=models.Filter(must=must),
         limit=top_k,
         with_payload=True,
     )

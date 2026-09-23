@@ -142,7 +142,10 @@ def compute_image_hash(image_bytes: bytes) -> str:
     return hashlib.sha256(image_bytes).hexdigest()
 
 
-def table_html_is_reliable(table_html: Optional[str]) -> bool:
+def table_html_is_reliable(
+    table_html: Optional[str],
+    page_text_chars: Optional[int] = None,
+) -> bool:
     """
     Heuristic: is this table's structure-inference HTML (unstructured's
     infer_table_structure=True, el.metadata.text_as_html) trustworthy
@@ -161,10 +164,35 @@ def table_html_is_reliable(table_html: Optional[str]) -> bool:
     perfectly fine table to Vision anyway) just cost an extra API call;
     false positives (skipping Vision for a genuinely broken table) lose
     real accuracy, so the bar for "reliable" is kept low on purpose.
+
+    page_text_chars: how many characters of real, extractable text the
+    SOURCE PAGE carries (pipeline/extractor.py::_pdf_page_text_chars()).
+    None means unknown (non-PDF, or the measurement failed) and is treated
+    as "assume fine", preserving the original behaviour.
+
+    2026-09-23 — the text-layer check below is the fix for a confirmed
+    live wrong answer. A page whose table is drawn as vector outlines (or
+    scanned) has no text layer, so unstructured's hi_res path OCRs it, and
+    OCR of a dense numeric table drops rows while still emitting
+    structurally valid <table> markup. Both structural checks above pass,
+    the table looks clean, and the missing rows are invisible — chat
+    reported 21.79 million sq ft for a figure that is actually 34.01.
+    Detecting the garbling in the OUTPUT was measured and rejected: those
+    tables score perfectly uniform on cell-count consistency and carry a
+    lower junk-character ratio than several genuinely good tables in the
+    same file. Whether the source page had a text layer at all is the
+    signal that actually separates them, and it's deterministic.
     """
     if not table_html or len(table_html.strip()) < 40:
         return False
     if table_html.count("<tr") < 2:   # need at least a header + one data row
+        return False
+    if (
+        page_text_chars is not None
+        and page_text_chars < settings.TABLE_TEXT_LAYER_MIN_CHARS
+    ):
+        # OCR-derived: structure may look fine while cell values/rows are
+        # silently wrong. Vision reads the rendered crop directly instead.
         return False
     return True
 
@@ -303,7 +331,11 @@ def caption_image_with_vision(
     prompt = _VISION_PROMPT + context_hint
 
     try:
-        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        client = OpenAI(
+            api_key=settings.OPENAI_API_KEY,
+            timeout=settings.LLM_REQUEST_TIMEOUT,
+            max_retries=settings.LLM_MAX_RETRIES,
+        )
         response = client.chat.completions.create(
             model=model or VISION_MODEL,
             max_tokens=800,

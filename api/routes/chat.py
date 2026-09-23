@@ -25,7 +25,7 @@ import uuid
 import json
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 from openai import OpenAI
@@ -46,11 +46,14 @@ from db.database import get_db_session_fastapi
 from db.models import ChatThread, ChatMessage
 from pipeline.retriever import retrieve, retrieve_multi, search, build_filter
 from pipeline import embedder, vector_store, storage
-from pipeline.memory import load_memory_from_db, build_prompt_with_history, select_attachable_crops
+from pipeline.memory import (
+    load_memory_from_db, build_prompt_with_history, select_attachable_crops, select_relevant_history,
+    source_tag, QUOTES_SENTINEL, QUOTE_LINE_PATTERN,
+)
 from pipeline.chat import chat_complete, chat_stream, generate_thread_title, generate_search_queries
 from pipeline.chat_storage import (
     create_thread, update_thread_title, increment_message_count,
-    save_human_message, save_ai_message,
+    save_human_message, save_ai_message, update_rolling_summary,
     get_thread, get_thread_messages,
 )
 from pipeline.image_processor import (
@@ -90,6 +93,7 @@ def _retrieve_with_image(
     org_unit_id:   str,
     top_k:         int = 5,
     doc_filter:    Optional[str] = None,
+    degraded:      Optional[list[str]] = None,
 ) -> tuple[list[dict], Optional[str]]:
     """
     When user attaches an image:
@@ -101,6 +105,13 @@ def _retrieve_with_image(
        original query once (fixes the old version's separate top_k slices
        being sorted on two different similarity scales before merging)
     Returns (chunks, image_caption_text)
+
+    degraded: see pipeline/retriever.py::search()'s docstring — same
+    out-param convention (mutated in place, internal-only, never on the
+    API response), threaded through both retrieve() fallback calls and
+    the two search() calls below, plus this function's own merge-rerank
+    step, so an image-attached turn gets the same debugging coverage as a
+    plain text turn instead of a silent gap.
     """
     try:
         image_bytes = base64.b64decode(image_base64)
@@ -119,8 +130,10 @@ def _retrieve_with_image(
 
         if caption is None:
             logger.warning("Vision captioning of user image failed — falling back to text search")
+            if degraded is not None:
+                degraded.append("vision_captioning")
             return retrieve(query=query, tenant_id=tenant_id, org_unit_id=org_unit_id,
-                           top_k=top_k, doc_filter=doc_filter), None
+                           top_k=top_k, doc_filter=doc_filter, degraded=degraded), None
 
         caption_search_text = build_image_embedding_text(
             caption=caption, doc_name="user_query", surrounding_text=query,
@@ -128,9 +141,9 @@ def _retrieve_with_image(
 
         query_filter = build_filter(tenant_id=tenant_id, org_unit_id=org_unit_id, doc_name=doc_filter)
         image_chunks = search(query=caption_search_text, query_filter=query_filter,
-                               mode="hybrid", top_k=top_k * 2, do_rerank=False)
+                               mode="hybrid", top_k=top_k * 2, do_rerank=False, degraded=degraded)
         text_chunks = search(query=query, query_filter=query_filter,
-                              mode="hybrid", top_k=top_k * 2, do_rerank=False)
+                              mode="hybrid", top_k=top_k * 2, do_rerank=False, degraded=degraded)
 
         # Merge by chunk id, then rerank the UNION against the original
         # query once — a single consistent ranking, not two separately
@@ -138,6 +151,11 @@ def _retrieve_with_image(
         by_id = {c["id"]: c for c in image_chunks + text_chunks}
         merged = list(by_id.values())
         if merged:
+            # Not wrapped in its own try/except, matching pre-existing
+            # behaviour — a failure here still falls through to the
+            # outer except below (full fallback to text-only retrieve()),
+            # unchanged from before this file added degraded tracking.
+            # Out of scope to also change that fallback behaviour here.
             scores = embedder.rerank(query, [c.get("chunk_text", "") for c in merged])
             for c, s in zip(merged, scores):
                 c["similarity"] = float(s)
@@ -151,8 +169,10 @@ def _retrieve_with_image(
 
     except Exception as e:
         logger.warning("Image-aware retrieval failed — falling back to text: %s", e)
+        if degraded is not None:
+            degraded.append("image_retrieval")
         return retrieve(query=query, tenant_id=tenant_id, org_unit_id=org_unit_id,
-                       top_k=top_k, doc_filter=doc_filter), None
+                       top_k=top_k, doc_filter=doc_filter, degraded=degraded), None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -181,7 +201,15 @@ def _chat_complete_with_image(
     the user's image goes at the end, not the front where it used to sit.
     """
     try:
-        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        # Multimodal answer call — the slowest LLM call in the app (it
+        # uploads up to MAX_ATTACHED_CROPS images), so an unbounded one was
+        # the most likely thing to hang a chat turn. See
+        # pipeline/chat.py::_build_llm for why these were unwired before.
+        client = OpenAI(
+            api_key=settings.OPENAI_API_KEY,
+            timeout=settings.CHAT_REQUEST_TIMEOUT,
+            max_retries=settings.CHAT_MAX_RETRIES,
+        )
 
         content: list[dict] = [{"type": "text", "text": prompt}]
         for path in crop_paths or []:
@@ -241,10 +269,16 @@ def _retrieve_chunks_sync(request: ChatMessageRequest, tenant_id: str, org_unit_
     that was the event loop being fully blocked, not a real deadlock; the
     call was still running to completion underneath the frozen loop.
 
-    Returns (chunks, image_caption) — same shape _prepare_chat needs.
+    Returns (chunks, image_caption, degraded) — same shape _prepare_chat
+    needs. degraded: which retrieval components silently fell back for
+    this specific turn (see pipeline/retriever.py::search()'s docstring)
+    — internal-only, persisted onto ChatMessage.degraded by _save_turn(),
+    never returned to the caller of the API.
     """
+    degraded: list[str] = []
+
     if request.image_base64:
-        return _retrieve_with_image(
+        chunks, caption = _retrieve_with_image(
             query            = request.query,
             image_base64     = request.image_base64,
             image_media_type = request.image_media_type or "image/jpeg",
@@ -252,7 +286,9 @@ def _retrieve_chunks_sync(request: ChatMessageRequest, tenant_id: str, org_unit_
             org_unit_id      = org_unit_id,
             top_k            = request.top_k,
             doc_filter       = request.doc_filter,
+            degraded         = degraded,
         )
+        return chunks, caption, degraded
 
     history_messages = memory.chat_memory.messages
     if history_messages:
@@ -262,14 +298,14 @@ def _retrieve_chunks_sync(request: ChatMessageRequest, tenant_id: str, org_unit_
         search_queries = generate_search_queries(request.query, history_messages, document_summary=document_summary)
         chunks = retrieve_multi(
             queries=search_queries, tenant_id=tenant_id, org_unit_id=org_unit_id,
-            top_k=request.top_k, doc_filter=request.doc_filter,
+            top_k=request.top_k, doc_filter=request.doc_filter, degraded=degraded,
         )
     else:
         chunks = retrieve(
             query=request.query, tenant_id=tenant_id, org_unit_id=org_unit_id,
-            top_k=request.top_k, doc_filter=request.doc_filter,
+            top_k=request.top_k, doc_filter=request.doc_filter, degraded=degraded,
         )
-    return chunks, None
+    return chunks, None, degraded
 
 
 async def _prepare_chat(request: ChatMessageRequest, tenant_id: str, org_unit_id: str, db: Session) -> tuple:
@@ -287,7 +323,15 @@ async def _prepare_chat(request: ChatMessageRequest, tenant_id: str, org_unit_id
         if not thread:
             raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found")
 
-    memory = load_memory_from_db(thread_id, tenant_id, org_unit_id, db)
+    memory, rolling_summary, window_message_ids = load_memory_from_db(thread_id, tenant_id, org_unit_id, db)
+    # run_in_threadpool: embeds the query and calls Qdrant — same blocking-
+    # call-on-the-event-loop concern as _retrieve_chunks_sync below (this
+    # app runs uvicorn --workers 1).
+    relevant_history = await run_in_threadpool(
+        select_relevant_history,
+        query=request.query, thread_id=thread_id, tenant_id=tenant_id, org_unit_id=org_unit_id,
+        exclude_ids=window_message_ids,
+    )
 
     # ── Retrieval — image-aware if image attached, always scoped ───────────
     # 2026-08-21 — conversational retrieval fix (query condensation, see
@@ -297,19 +341,85 @@ async def _prepare_chat(request: ChatMessageRequest, tenant_id: str, org_unit_id
     # blocking CPU/IO work — see _retrieve_chunks_sync's docstring for why
     # calling it directly here would freeze the entire API, not just this
     # request.
-    chunks, image_caption = await run_in_threadpool(_retrieve_chunks_sync, request, tenant_id, org_unit_id, memory)
+    chunks, image_caption, degraded = await run_in_threadpool(_retrieve_chunks_sync, request, tenant_id, org_unit_id, memory)
 
     prompt = build_prompt_with_history(
-        query          = request.query,
-        memory         = memory,
-        context_chunks = chunks,
-        doc_filter     = request.doc_filter,
+        query            = request.query,
+        memory           = memory,
+        context_chunks   = chunks,
+        doc_filter       = request.doc_filter,
+        rolling_summary  = rolling_summary,
+        relevant_history = relevant_history,
     )
 
-    return thread_id, is_new_thread, memory, chunks, prompt, image_caption
+    return thread_id, is_new_thread, memory, chunks, prompt, image_caption, degraded
 
 
-def _build_sources(chunks: list[dict]) -> list[dict]:
+def _normalize_for_match(text: str) -> str:
+    """Collapse all whitespace runs to single spaces for a forgiving-but-
+    still-exact substring check — the model can reproduce a quote with a
+    different line-wrap than the source without that counting as a
+    fabrication, but it still can't paraphrase a single word."""
+    return " ".join((text or "").split())
+
+
+def _split_answer_and_quotes(raw_content: str) -> tuple[str, dict[str, str]]:
+    """
+    Splits the raw LLM completion into (clean_answer, quotes_by_tag).
+
+    pipeline/memory.py's QUOTED EVIDENCE prompt rule asks the model to
+    append a "===QUOTES===" block after its answer, one line per cited
+    [Source: ...] tag with a verbatim quote. This is ONE LLM call (no
+    extra cost/latency) — the block is parsed out here and never shown to
+    the user as part of the answer; ChatMessage.content stays exactly the
+    clean prose it always was.
+
+    No sentinel found (model skipped the rule, or had nothing to quote) ->
+    (raw_content unchanged, {}) — this feature is additive, never a hard
+    requirement for chat to work.
+    """
+    if QUOTES_SENTINEL not in raw_content:
+        return raw_content.strip(), {}
+
+    answer_part, _, quotes_part = raw_content.partition(QUOTES_SENTINEL)
+    quotes_by_tag: dict[str, str] = {}
+    for match in QUOTE_LINE_PATTERN.finditer(quotes_part):
+        tag, quote = match.group(1), match.group(2).strip()
+        if quote:
+            quotes_by_tag[tag] = quote
+    return answer_part.strip(), quotes_by_tag
+
+
+def _verified_quote_for_chunk(chunk: dict, quotes_by_tag: dict[str, str]) -> Optional[str]:
+    """
+    Looks up chunk's quote by its source_tag() and confirms it's an
+    actual substring of the chunk's own content (whitespace-normalized)
+    before trusting it — the QUOTED EVIDENCE rule tells the model to copy
+    verbatim, but "the model was told to" is not "the model did"; an
+    LLM reconstructing a quote from memory instead of copying it is
+    exactly the failure mode this guards against. A quote that doesn't
+    verify is dropped silently (logged), never surfaced as if it were
+    confirmed — same "don't show a bad citation as if it were a good one"
+    principle as everything else in this pipeline's source-citation rules.
+    """
+    tag = source_tag(chunk)
+    quote = quotes_by_tag.get(tag)
+    if not quote:
+        return None
+
+    content = chunk.get("image_caption") or chunk.get("chunk_text") or ""
+    if _normalize_for_match(quote) not in _normalize_for_match(content):
+        logger.warning(
+            "Quoted evidence for %s failed verbatim verification against its "
+            "own chunk content — dropping it rather than showing an unverified quote",
+            tag,
+        )
+        return None
+    return quote
+
+
+def _build_sources(chunks: list[dict], quotes_by_tag: Optional[dict[str, str]] = None) -> list[dict]:
+    quotes_by_tag = quotes_by_tag or {}
     return [
         {
             "doc_name":    c["doc_name"],
@@ -322,6 +432,7 @@ def _build_sources(chunks: list[dict]) -> list[dict]:
             "page_number":     c.get("page_number"),
             "section_heading": c.get("section_heading"),
             "table_html":      c.get("table_html"),
+            "quoted_text":     _verified_quote_for_chunk(c, quotes_by_tag),
         }
         for c in chunks
     ]
@@ -330,9 +441,11 @@ def _build_sources(chunks: list[dict]) -> list[dict]:
 async def _save_turn(
     thread_id: str, tenant_id: str, org_unit_id: str, is_new_thread: bool,
     query: str, answer: str, sources: list,
+    background_tasks: BackgroundTasks,
     prompt_tokens: Optional[int] = None,
     completion_tokens: Optional[int] = None,
     image_caption: Optional[str] = None,
+    degraded: Optional[list[str]] = None,
 ) -> Optional[str]:
     # run_in_threadpool: save_*_message()/increment_message_count() are
     # synchronous SQLAlchemy calls, and generate_thread_title() below makes
@@ -347,8 +460,25 @@ async def _save_turn(
         content=answer, sources=sources,
         prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
         has_image=image_caption is not None, image_caption=image_caption,
+        degraded=degraded,
     )
     await run_in_threadpool(increment_message_count, thread_id, tenant_id, org_unit_id)
+
+    # 2026-09-23: moved off the response path — this is an LLM call
+    # (pipeline/chat_storage.py::_summarize_turns), and the user was
+    # previously waiting on it for every turn that had aged-out messages
+    # to fold in, on top of the answer they actually asked for. Starlette
+    # runs BackgroundTasks AFTER the response is sent, so this now adds
+    # zero latency to the turn. Safe to lag: pipeline/memory.py::
+    # load_memory_from_db()'s window is now derived FROM
+    # rolling_summary_through (see that function's docstring), so however
+    # far behind this runs, the next prompt still sees every message —
+    # never a gap, just a temporarily bigger verbatim window. Correctness
+    # of what background_tasks eventually writes (never regressing
+    # rolling_summary_through, even if two updates for the same thread
+    # ever overlap) is enforced in update_rolling_summary() itself, not
+    # here — this call site doesn't need to know about that.
+    background_tasks.add_task(update_rolling_summary, thread_id, tenant_id, org_unit_id)
 
     thread_title = None
     if is_new_thread:
@@ -375,11 +505,12 @@ async def _save_turn(
 )
 async def send_message(
     request: ChatMessageRequest,
+    background_tasks: BackgroundTasks,
     tenant_id: str = Depends(get_tenant_id),
     org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
-    thread_id, is_new_thread, memory, chunks, prompt, image_caption = await _prepare_chat(
+    thread_id, is_new_thread, memory, chunks, prompt, image_caption, degraded = await _prepare_chat(
         request, tenant_id, org_unit_id, db
     )
 
@@ -393,7 +524,7 @@ async def send_message(
         )
         await _save_turn(
             thread_id, tenant_id, org_unit_id, is_new_thread, request.query, fallback_msg, [],
-            image_caption=image_caption,
+            background_tasks, image_caption=image_caption, degraded=degraded,
         )
         return ChatMessageResponse(
             message_id   = uuid.uuid4(),
@@ -439,15 +570,21 @@ async def send_message(
         result = await run_in_threadpool(chat_complete, prompt, crop_paths or None)
         image_understood = False
 
-    answer  = result["content"]
-    sources = _build_sources(chunks)
+    # QUOTES_SENTINEL block (pipeline/memory.py's QUOTED EVIDENCE rule) is
+    # parsed out here — result["content"] never reaches the user with it
+    # still attached, and chunks are already relevance-sorted (the
+    # retrieval pipeline's own ordering), so chunks[:MAX_SOURCES_RETURNED]
+    # is "the top N", not an arbitrary slice.
+    answer, quotes_by_tag = _split_answer_and_quotes(result["content"])
+    sources = _build_sources(chunks[:settings.MAX_SOURCES_RETURNED], quotes_by_tag)
 
     thread_title = await _save_turn(
         thread_id=thread_id, tenant_id=tenant_id, org_unit_id=org_unit_id, is_new_thread=is_new_thread,
         query=request.query, answer=answer, sources=sources,
+        background_tasks=background_tasks,
         prompt_tokens=result.get("prompt_tokens"),
         completion_tokens=result.get("completion_tokens"),
-        image_caption=image_caption,
+        image_caption=image_caption, degraded=degraded,
     )
 
     return ChatMessageResponse(

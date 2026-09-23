@@ -110,14 +110,22 @@ def chunk_document(extracted: ExtractedDocument) -> list[Chunk]:
             # structurally impossible — a table chunk can only ever
             # contain that one table.
             isolate_table=True,
-            # skip_table_chunking left at its default (False) — deliberate:
-            # this would stop a large table from ever being hard-split
-            # into TableChunk fragments regardless of size, which trades
-            # coherence for potentially oversized chunks (worse embedding
-            # precision, more prompt tokens). Not enabling until we
-            # actually observe a large-table-got-fragmented failure —
-            # today's real, confirmed failure was contamination, not
-            # fragmentation.
+            # 2026-09-23: flipped to True — the large-table-got-fragmented
+            # failure this was deliberately left disabled for has now been
+            # confirmed live: a 17-row residential-projects table (Godrej
+            # Properties Bengaluru area annexure) exceeded new_after_n_chars
+            # (2700 = 0.9 * MAX_CHUNK_SIZE) and was hard-split mid-row,
+            # silently dropping the last 5 rows from every chunk that
+            # existed. Any "sum this table" question answered from whatever
+            # subset of fragments got retrieved was then wrong by
+            # construction, independent of retrieval/reranking correctness.
+            # skip_table_chunking=True keeps a table as a single chunk
+            # regardless of size — trades a larger chunk (and more prompt
+            # tokens when it's retrieved) for the table never losing rows.
+            # Table chunks are already exempt from is_meaningful_chunk()'s
+            # size-oriented filter, so a bigger table chunk won't be
+            # discarded either.
+            skip_table_chunking=True,
             repeat_table_headers=True
         )
     except Exception as e:

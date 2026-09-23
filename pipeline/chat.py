@@ -77,6 +77,13 @@ def _build_llm(streaming: bool = False, for_answer: bool = False) -> ChatOpenAI:
         temperature=temperature,
         max_tokens=1024,
         streaming=streaming,
+        # 2026-09-23: LLM_REQUEST_TIMEOUT/LLM_MAX_RETRIES were declared in
+        # settings.py and set in .env but read by NOTHING — so an OpenAI
+        # call had no deadline and could hang indefinitely. Confirmed live:
+        # a single chat turn sat for two full minutes between "retrieved
+        # chunks" and "saved messages" with nothing able to cut it off.
+        timeout=settings.CHAT_REQUEST_TIMEOUT,
+        max_retries=settings.CHAT_MAX_RETRIES,
     )
 
 
@@ -164,7 +171,10 @@ def generate_search_queries(query: str, history_messages: list, document_summary
             f"terms, not to answer the question):\n{document_summary}\n\n"
             if document_summary else ""
         )
-        llm = ChatOpenAI(api_key=settings.OPENAI_API_KEY, model=settings.MAP_MODEL, temperature=0.0)
+        llm = ChatOpenAI(
+            api_key=settings.OPENAI_API_KEY, model=settings.MAP_MODEL, temperature=0.0,
+            timeout=settings.CHAT_REQUEST_TIMEOUT, max_retries=settings.CHAT_MAX_RETRIES,
+        )
         structured_llm = llm.with_structured_output(SearchQueries)
         result: SearchQueries = structured_llm.invoke(
             f"{summary_block}"
