@@ -10,6 +10,7 @@ Window = last N turns only (not entire history) to avoid token overflow.
 """
 import io
 import os
+import re
 import uuid
 from typing import Optional
 import pandas as pd
@@ -351,6 +352,37 @@ def select_relevant_history(
     return results[:limit]
 
 
+# 2026-09-23: the marker build_prompt_with_history()'s QUOTED EVIDENCE
+# rule instructs the LLM to emit after its answer, and what
+# api/routes/chat.py::_split_answer_and_quotes() splits the raw
+# completion on. One constant so the instruction and the parser can
+# never disagree on the literal string.
+QUOTES_SENTINEL = "===QUOTES==="
+
+# Matches a line like: [Source: report.pdf, page 3] "the exact sentence"
+# Tag = everything inside the brackets (reuses whatever source_tag()
+# produced, unconstrained); quote = the double-quoted text after it.
+QUOTE_LINE_PATTERN = re.compile(r'(\[Source:[^\]]+\])\s*"([^"]+)"')
+
+
+def source_tag(chunk: dict) -> str:
+    """
+    The exact [Source: doc_name, page N] / [Source: doc_name, Section:
+    heading] string for a chunk — single source of truth so the prompt
+    (what the LLM is told to cite verbatim) and api/routes/chat.py's
+    quote-parsing (matching a "===QUOTES===" line back to the chunk it
+    came from) can never drift apart. Previously inlined only in
+    build_prompt_with_history()'s context loop below.
+    """
+    location_bits = []
+    if chunk.get("page_number") is not None:
+        location_bits.append(f"page {chunk['page_number']}")
+    if chunk.get("section_heading"):
+        location_bits.append(f"Section: {chunk['section_heading']}")
+    location = ", ".join(location_bits)
+    return f"[Source: {chunk['doc_name']}{', ' + location if location else ''}]"
+
+
 def build_prompt_with_history(
     query: str,
     memory: ConversationBufferWindowMemory,
@@ -404,7 +436,7 @@ def build_prompt_with_history(
 
 RULES:
 1. SOURCE: Answer only from the data below — never outside knowledge, though related reasoning over that data is appreciated. Take ALL of it into account before answering, and apply semantic sense to complex queries.
-2. RESPONSE SCHEMA — mandatory, no exceptions: the answer stated concisely in your own words but within one sentence, then the [Source: ...] tag at the end, nothing else.
+2. RESPONSE SCHEMA — mandatory, no exceptions: the answer stated concisely in your own words but within one sentence, then the [Source: ...] tag at the end, nothing else in the answer itself. (The QUOTED EVIDENCE block that rule 10 requires comes AFTER this — it is a separate, required block, not part of "nothing else.")
 3. PARTIAL DATA: State exactly what IS known, then stop — do not follow it with "I don't have enough information," that's a contradiction, and never open with what the documents do NOT say. Lead with the fact you have. Partial facts are still an answer.
 4. CALCULATION: If the documents don't state something directly, find data to calculate it from — including POSSIBLY HELPFUL TABLES, which you may extract from, compute on, and reason over. Exact figures to 2 decimal places, never rounded off or approximate. If calculation isn't possible either, reason it out.
 5. CITATION: Cite only the [Source: doc_name, page N] or [Source: doc_name, Section: heading] tag exactly as it appears in the context below — never invent a citation format.
@@ -412,6 +444,7 @@ RULES:
 7. ATTACHED VISUALS: Items listed in DOCUMENT CONTEXT as "ATTACHED VISUAL k of N" are actual images attached to this message, deliberately carrying no written description — the image itself is the data. Read the pixels: transcribe the exact axis values, labels, legend entries and row/column figures, and compute from them when the question has a relation to them. A visual with no description is NOT missing information; "the description doesn't say" is never a valid reason to refuse when the visual is attached.
 8. DIVERSITY: The answer to the query/question can be across multiple chunks/data points, images or tables. You haev to handle them efficiecntly going through the entire content before replying. You might also need to perfrom cross-data calculations, make sure you handle them efficiently.
 9. CONVERSATION MEMORY: EARLIER CONVERSATION SUMMARY, RELEVANT EARLIER MESSAGES, and CONVERSATION HISTORY are conversation context, not document sources — use them to understand what was already discussed, resolve follow-ups ("it", "that project", "the one you mentioned"), and avoid repeating yourself, but never cite them with a [Source: ...] tag; only DOCUMENT CONTEXT and POSSIBLY HELPFUL TABLES are citable sources.
+10. QUOTED EVIDENCE — required after every answer that cites a source: on a new line write {QUOTES_SENTINEL}, then one line per cited [Source: ...] tag: <tag> "<verbatim quote copied exactly from that source>". No paraphrasing — copy the exact substring, or skip that source.
 """
     # Document context from retrieved chunks — text and image chunks are
     # formatted differently so the LLM knows which parts came from GPT-4o
@@ -441,13 +474,7 @@ RULES:
             # the citation tag the system prompt instructs the LLM to
             # reuse verbatim inline, so an answer can point back to a
             # specific page/section instead of just a doc name.
-            location_bits = []
-            if chunk.get("page_number") is not None:
-                location_bits.append(f"page {chunk['page_number']}")
-            if chunk.get("section_heading"):
-                location_bits.append(f"Section: {chunk['section_heading']}")
-            location = ", ".join(location_bits)
-            tag = f"[Source: {chunk['doc_name']}{', ' + location if location else ''}]"
+            tag = source_tag(chunk)
 
             if chunk.get("role") == "image":
                 image_type = chunk.get("image_type") or "image"

@@ -254,6 +254,15 @@ class Settings(BaseSettings):
     # left to top_k so cost/latency stay predictable.
     MAX_ATTACHED_CROPS: int = 6
 
+    # How many sources are returned to the caller per chat answer.
+    # Retrieval/reranking still uses the full request.top_k for what the
+    # LLM answers FROM — this only trims the CITATION LIST shown to the
+    # user afterward (chunks are already relevance-sorted, so this is a
+    # top-N slice, not an arbitrary one). Kept separate from top_k because
+    # a longer answer can legitimately draw on more context than is useful
+    # to show as a citation list.
+    MAX_SOURCES_RETURNED: int = 3
+
     # ── Content extraction (unstructured) ───────────────────────────────────
     # "hi_res" runs the layout-detection model + OCR fallback (accurate,
     # slower); "fast" skips both (quick, native-text-layer PDFs only).
@@ -487,6 +496,7 @@ class Settings(BaseSettings):
         "SEARCH_CANDIDATES_MAX",
         "SEARCH_SCORE_THRESHOLD",
         "MAX_ATTACHED_CROPS",
+        "MAX_SOURCES_RETURNED",
         "STORAGE_LOCAL_TTL_HOURS",
         "MAX_IMAGES_PER_DOCUMENT",
         "DOC_SHORTLIST_LIMIT",

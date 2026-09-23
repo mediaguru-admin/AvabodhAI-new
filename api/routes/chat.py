@@ -46,7 +46,10 @@ from db.database import get_db_session_fastapi
 from db.models import ChatThread, ChatMessage
 from pipeline.retriever import retrieve, retrieve_multi, search, build_filter
 from pipeline import embedder, vector_store, storage
-from pipeline.memory import load_memory_from_db, build_prompt_with_history, select_attachable_crops, select_relevant_history
+from pipeline.memory import (
+    load_memory_from_db, build_prompt_with_history, select_attachable_crops, select_relevant_history,
+    source_tag, QUOTES_SENTINEL, QUOTE_LINE_PATTERN,
+)
 from pipeline.chat import chat_complete, chat_stream, generate_thread_title, generate_search_queries
 from pipeline.chat_storage import (
     create_thread, update_thread_title, increment_message_count,
@@ -352,7 +355,71 @@ async def _prepare_chat(request: ChatMessageRequest, tenant_id: str, org_unit_id
     return thread_id, is_new_thread, memory, chunks, prompt, image_caption, degraded
 
 
-def _build_sources(chunks: list[dict]) -> list[dict]:
+def _normalize_for_match(text: str) -> str:
+    """Collapse all whitespace runs to single spaces for a forgiving-but-
+    still-exact substring check — the model can reproduce a quote with a
+    different line-wrap than the source without that counting as a
+    fabrication, but it still can't paraphrase a single word."""
+    return " ".join((text or "").split())
+
+
+def _split_answer_and_quotes(raw_content: str) -> tuple[str, dict[str, str]]:
+    """
+    Splits the raw LLM completion into (clean_answer, quotes_by_tag).
+
+    pipeline/memory.py's QUOTED EVIDENCE prompt rule asks the model to
+    append a "===QUOTES===" block after its answer, one line per cited
+    [Source: ...] tag with a verbatim quote. This is ONE LLM call (no
+    extra cost/latency) — the block is parsed out here and never shown to
+    the user as part of the answer; ChatMessage.content stays exactly the
+    clean prose it always was.
+
+    No sentinel found (model skipped the rule, or had nothing to quote) ->
+    (raw_content unchanged, {}) — this feature is additive, never a hard
+    requirement for chat to work.
+    """
+    if QUOTES_SENTINEL not in raw_content:
+        return raw_content.strip(), {}
+
+    answer_part, _, quotes_part = raw_content.partition(QUOTES_SENTINEL)
+    quotes_by_tag: dict[str, str] = {}
+    for match in QUOTE_LINE_PATTERN.finditer(quotes_part):
+        tag, quote = match.group(1), match.group(2).strip()
+        if quote:
+            quotes_by_tag[tag] = quote
+    return answer_part.strip(), quotes_by_tag
+
+
+def _verified_quote_for_chunk(chunk: dict, quotes_by_tag: dict[str, str]) -> Optional[str]:
+    """
+    Looks up chunk's quote by its source_tag() and confirms it's an
+    actual substring of the chunk's own content (whitespace-normalized)
+    before trusting it — the QUOTED EVIDENCE rule tells the model to copy
+    verbatim, but "the model was told to" is not "the model did"; an
+    LLM reconstructing a quote from memory instead of copying it is
+    exactly the failure mode this guards against. A quote that doesn't
+    verify is dropped silently (logged), never surfaced as if it were
+    confirmed — same "don't show a bad citation as if it were a good one"
+    principle as everything else in this pipeline's source-citation rules.
+    """
+    tag = source_tag(chunk)
+    quote = quotes_by_tag.get(tag)
+    if not quote:
+        return None
+
+    content = chunk.get("image_caption") or chunk.get("chunk_text") or ""
+    if _normalize_for_match(quote) not in _normalize_for_match(content):
+        logger.warning(
+            "Quoted evidence for %s failed verbatim verification against its "
+            "own chunk content — dropping it rather than showing an unverified quote",
+            tag,
+        )
+        return None
+    return quote
+
+
+def _build_sources(chunks: list[dict], quotes_by_tag: Optional[dict[str, str]] = None) -> list[dict]:
+    quotes_by_tag = quotes_by_tag or {}
     return [
         {
             "doc_name":    c["doc_name"],
@@ -365,6 +432,7 @@ def _build_sources(chunks: list[dict]) -> list[dict]:
             "page_number":     c.get("page_number"),
             "section_heading": c.get("section_heading"),
             "table_html":      c.get("table_html"),
+            "quoted_text":     _verified_quote_for_chunk(c, quotes_by_tag),
         }
         for c in chunks
     ]
@@ -502,8 +570,13 @@ async def send_message(
         result = await run_in_threadpool(chat_complete, prompt, crop_paths or None)
         image_understood = False
 
-    answer  = result["content"]
-    sources = _build_sources(chunks)
+    # QUOTES_SENTINEL block (pipeline/memory.py's QUOTED EVIDENCE rule) is
+    # parsed out here — result["content"] never reaches the user with it
+    # still attached, and chunks are already relevance-sorted (the
+    # retrieval pipeline's own ordering), so chunks[:MAX_SOURCES_RETURNED]
+    # is "the top N", not an arbitrary slice.
+    answer, quotes_by_tag = _split_answer_and_quotes(result["content"])
+    sources = _build_sources(chunks[:settings.MAX_SOURCES_RETURNED], quotes_by_tag)
 
     thread_title = await _save_turn(
         thread_id=thread_id, tenant_id=tenant_id, org_unit_id=org_unit_id, is_new_thread=is_new_thread,
