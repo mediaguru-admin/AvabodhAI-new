@@ -379,6 +379,19 @@ class Settings(BaseSettings):
     # endpoint must never be able to stall ingestion itself.
     CORE_WEBHOOK_TIMEOUT_SECONDS: float = 5.0
 
+    # ── LLM execution log (pipeline/llm_log.py) ────────────────────────────
+    # Every chat-completion / vision call is written to llm_execution_logs
+    # (read via GET /llm-logs). Prompt/response text is capped at
+    # LLM_LOG_MAX_TEXT_CHARS per field; base64 images are never stored.
+    LLM_LOG_ENABLED: bool = True
+    LLM_LOG_MAX_TEXT_CHARS: int = 50000
+    # Optional Kafka forward of each log row, off by default. The event uses
+    # the llm.execution.logged.v1 envelope; the topic template receives
+    # {tenant_id}. Publishing failures never affect the LLM call.
+    LLM_LOG_KAFKA_ENABLED: bool = False
+    KAFKA_BOOTSTRAP_SERVERS: str = ""
+    LLM_LOG_KAFKA_TOPIC_TEMPLATE: str = "clariona.{tenant_id}.llm.execution.logs.v1"
+
     LOG_LEVEL: str = "INFO"
     LOG_FILE: str = "avabodh.log"
 
@@ -505,6 +518,7 @@ class Settings(BaseSettings):
         "MEMORY_SEMANTIC_RECALL_LIMIT",
         "MEMORY_SUMMARY_MAX_TOKENS",
         "TABLE_TEXT_LAYER_MIN_CHARS",
+        "LLM_LOG_MAX_TEXT_CHARS",
         mode="before",
     )
     @classmethod

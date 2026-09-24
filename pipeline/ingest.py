@@ -23,6 +23,7 @@ from typing import Optional
 from langchain_core.documents import Document as LCDocument
 
 from pipeline import extractor, chunker, embedder, vector_store, storage, summariser, object_store, webhook
+from pipeline.llm_log import set_llm_context
 from pipeline.image_processor import (
     extract_images_from_elements, extract_images_from_soup,
     caption_image_with_vision, build_image_embedding_text, compute_image_hash,
@@ -320,6 +321,10 @@ def process_document(
     datetime -> ISO string conversion.
     """
     metadata = metadata or {}
+    # LLM calls below are logged against this document (pipeline/llm_log.py).
+    # Set here, not only by the request middleware, so cli.py runs log too.
+    set_llm_context(tenant_id=tenant_id, org_unit_id=org_unit_id,
+                    entity_type="document", entity_id=document_id)
     storage.set_status(document_id, tenant_id, org_unit_id, "PROCESSING")
     webhook.notify_status_change(document_id, tenant_id, org_unit_id, "PROCESSING")
 
@@ -529,6 +534,10 @@ def process_web_document(
 ) -> None:
     """Web-scrape ingestion — pipeline/scraper.py already fetched + converted the page to markdown (+ kept raw_html for image extraction). effective_from/effective_to: see process_document()'s docstring."""
     metadata = metadata or {}
+    # LLM calls below are logged against this document (pipeline/llm_log.py).
+    # Set here, not only by the request middleware, so cli.py runs log too.
+    set_llm_context(tenant_id=tenant_id, org_unit_id=org_unit_id,
+                    entity_type="document", entity_id=document_id)
     storage.set_status(document_id, tenant_id, org_unit_id, "PROCESSING")
     webhook.notify_status_change(document_id, tenant_id, org_unit_id, "PROCESSING")
 

@@ -20,6 +20,7 @@ import base64
 import hashlib
 import io
 import re
+import time
 from typing import Optional
 
 import httpx
@@ -28,6 +29,7 @@ from pydantic import BaseModel, Field, field_validator
 from openai import OpenAI
 
 from config.settings import get_settings
+from pipeline.llm_log import record_openai_sdk_call
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -336,30 +338,39 @@ def caption_image_with_vision(
             timeout=settings.LLM_REQUEST_TIMEOUT,
             max_retries=settings.LLM_MAX_RETRIES,
         )
-        response = client.chat.completions.create(
-            model=model or VISION_MODEL,
-            max_tokens=800,
-            temperature=0.0,
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type":  "image_url",
-                            "image_url": {
-                                "url":    f"data:{media_type};base64,{b64}",
-                                "detail": "high",
-                            },
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type":  "image_url",
+                        "image_url": {
+                            "url":    f"data:{media_type};base64,{b64}",
+                            "detail": "high",
                         },
-                        {
-                            "type": "text",
-                            "text": prompt,
-                        },
-                    ],
-                }
-            ],
-        )
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                ],
+            }
+        ]
+        started = time.monotonic()
+        try:
+            response = client.chat.completions.create(
+                model=model or VISION_MODEL,
+                max_tokens=800,
+                temperature=0.0,
+                response_format={"type": "json_object"},
+                messages=messages,
+            )
+        except Exception as e:
+            record_openai_sdk_call(purpose="image_caption", model_name=model or VISION_MODEL,
+                                   messages=messages, started=started, error=e)
+            raise
+        record_openai_sdk_call(purpose="image_caption", model_name=model or VISION_MODEL,
+                               messages=messages, started=started, response=response)
 
         raw_json = response.choices[0].message.content
         import json
