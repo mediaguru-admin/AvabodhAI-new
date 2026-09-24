@@ -26,13 +26,14 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from config.settings import get_settings
+from pipeline.llm_log import llm_log_kwargs
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 settings = get_settings()
 
 
-def _build_llm(streaming: bool = False, for_answer: bool = False) -> ChatOpenAI:
+def _build_llm(streaming: bool = False, for_answer: bool = False, purpose: str = "chat_answer") -> ChatOpenAI:
     """
     for_answer: True for the call that actually answers a user's question
     (chat_complete / chat_stream), False for incidental helper calls like
@@ -62,6 +63,7 @@ def _build_llm(streaming: bool = False, for_answer: bool = False) -> ChatOpenAI:
                 temperature=temperature,
                 max_tokens=1024,
                 streaming=streaming,
+                **llm_log_kwargs(purpose),
             )
         return ChatOpenAI(
             api_key="ollama",
@@ -70,6 +72,7 @@ def _build_llm(streaming: bool = False, for_answer: bool = False) -> ChatOpenAI:
             temperature=temperature,
             max_tokens=1024,
             streaming=streaming,
+            **llm_log_kwargs(purpose),
         )
     return ChatOpenAI(
         api_key=settings.OPENAI_API_KEY,
@@ -84,6 +87,7 @@ def _build_llm(streaming: bool = False, for_answer: bool = False) -> ChatOpenAI:
         # chunks" and "saved messages" with nothing able to cut it off.
         timeout=settings.CHAT_REQUEST_TIMEOUT,
         max_retries=settings.CHAT_MAX_RETRIES,
+        **llm_log_kwargs(purpose),
     )
 
 
@@ -93,7 +97,7 @@ def generate_thread_title(first_query: str) -> str:
     Called only once per thread — on first message.
     """
     try:
-        llm = _build_llm(streaming=False)
+        llm = _build_llm(streaming=False, purpose="chat_thread_title")
         messages = [
             SystemMessage(content="Generate a short 4-6 word title for this conversation. Return only the title, nothing else."),
             HumanMessage(content=first_query),
@@ -174,6 +178,7 @@ def generate_search_queries(query: str, history_messages: list, document_summary
         llm = ChatOpenAI(
             api_key=settings.OPENAI_API_KEY, model=settings.MAP_MODEL, temperature=0.0,
             timeout=settings.CHAT_REQUEST_TIMEOUT, max_retries=settings.CHAT_MAX_RETRIES,
+            **llm_log_kwargs("chat_query_rewrite"),
         )
         structured_llm = llm.with_structured_output(SearchQueries)
         result: SearchQueries = structured_llm.invoke(

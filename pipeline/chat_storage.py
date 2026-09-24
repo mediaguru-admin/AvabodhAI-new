@@ -34,6 +34,7 @@ from db.models import ChatThread, ChatMessage
 from db.database import get_db_session_context
 from pipeline import embedder, vector_store
 from config.settings import get_settings
+from pipeline.llm_log import llm_log_kwargs, set_llm_context
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -73,6 +74,7 @@ def _summarize_turns(existing_summary: Optional[str], new_turns_text: str, threa
         max_tokens=settings.MEMORY_SUMMARY_MAX_TOKENS,
         timeout=settings.CHAT_REQUEST_TIMEOUT,
         max_retries=settings.CHAT_MAX_RETRIES,
+        **llm_log_kwargs("chat_rolling_summary"),
     )
     chain = _ROLLING_SUMMARY_PROMPT | llm | StrOutputParser()
 
@@ -169,6 +171,8 @@ def update_rolling_summary(thread_id: str, tenant_id: str, org_unit_id: str) -> 
     guards the DB work around it (connection drop, session error, a
     malformed thread_id).
     """
+    set_llm_context(tenant_id=tenant_id, org_unit_id=org_unit_id,
+                    entity_type="chat_thread", entity_id=thread_id)
     lock = _get_thread_lock(thread_id)
     if not lock.acquire(blocking=False):
         logger.info(

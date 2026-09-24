@@ -21,6 +21,7 @@ department's, documents or thread history.
 """
 
 import base64
+import time
 import uuid
 import json
 from typing import Optional
@@ -50,6 +51,7 @@ from pipeline.memory import (
     load_memory_from_db, build_prompt_with_history, select_attachable_crops, select_relevant_history,
     source_tag, QUOTES_SENTINEL, QUOTE_LINE_PATTERN,
 )
+from pipeline.llm_log import record_openai_sdk_call, set_llm_context
 from pipeline.chat import chat_complete, chat_stream, generate_thread_title, generate_search_queries
 from pipeline.chat_storage import (
     create_thread, update_thread_title, increment_message_count,
@@ -232,12 +234,21 @@ def _chat_complete_with_image(
             },
         })
 
-        response = client.chat.completions.create(
-            model=CHAT_IMAGE_MODEL,
-            max_tokens=1500,
-            temperature=0.0,
-            messages=[{"role": "user", "content": content}],
-        )
+        messages = [{"role": "user", "content": content}]
+        started = time.monotonic()
+        try:
+            response = client.chat.completions.create(
+                model=CHAT_IMAGE_MODEL,
+                max_tokens=1500,
+                temperature=0.0,
+                messages=messages,
+            )
+        except Exception as e:
+            record_openai_sdk_call(purpose="chat_answer_image", model_name=CHAT_IMAGE_MODEL,
+                                   messages=messages, started=started, error=e)
+            raise
+        record_openai_sdk_call(purpose="chat_answer_image", model_name=CHAT_IMAGE_MODEL,
+                               messages=messages, started=started, response=response)
 
         return {
             "content":           response.choices[0].message.content,
@@ -322,6 +333,10 @@ async def _prepare_chat(request: ChatMessageRequest, tenant_id: str, org_unit_id
         thread = get_thread(thread_id, tenant_id, org_unit_id, db)
         if not thread:
             raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found")
+
+    # Every LLM call for the rest of this turn (and its background tasks)
+    # is logged against this thread — see pipeline/llm_log.py.
+    set_llm_context(entity_type="chat_thread", entity_id=thread_id)
 
     memory, rolling_summary, window_message_ids = load_memory_from_db(thread_id, tenant_id, org_unit_id, db)
     # run_in_threadpool: embeds the query and calls Qdrant — same blocking-

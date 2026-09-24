@@ -16,7 +16,8 @@ Tables:
 4. ChatMessage             — individual chat messages (embedding columns
                              removed — chat-message vectors now live in
                              Qdrant's avabodh_chat_messages collection)
-5. KBDocument / KBChatHistory — the SEPARATE /kb subsystem (api/routes/kb.py,
+5. LLMExecutionLog         — one row per LLM chat/vision call (pipeline/llm_log.py)
+6. KBDocument / KBChatHistory — the SEPARATE /kb subsystem (api/routes/kb.py,
                              pipeline/kb_pipeline.py). Out of scope for this
                              migration — left untouched, do not modify
                              without a separate decision from Vijay.
@@ -350,7 +351,54 @@ class ChatMessage(Base):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Knowledge Base (KB) Tables — SEPARATE subsystem, out of scope, untouched
+# 6. LLMExecutionLog — one row per chat-completion / vision call
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LLMExecutionLog(Base):
+    """
+    Written by pipeline/llm_log.py, read via GET /llm-logs. `id` is also
+    the execution_id of the optional Kafka event, so a consumer's copy can
+    be matched back to this row. client_id is the caller's X-Client-ID
+    header, recorded as sent (not authenticated).
+    """
+    __tablename__ = "llm_execution_logs"
+
+    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id   = Column(String(128), nullable=False)
+    org_unit_id = Column(String(128), nullable=False)
+    client_id   = Column(String(128), nullable=True)
+    request_id  = Column(String(128), nullable=True)
+
+    purpose     = Column(String(64), nullable=False, index=True)
+    provider    = Column(String(32), nullable=False)
+    model_name  = Column(String(128), nullable=False)
+    status      = Column(String(32), nullable=False)
+    error_message = Column(Text, nullable=True)
+
+    system_prompt = Column(Text, nullable=True)
+    user_prompt   = Column(Text, nullable=True)
+    response_text = Column(Text, nullable=True)
+
+    prompt_tokens     = Column(Integer, nullable=True)
+    completion_tokens = Column(Integer, nullable=True)
+    total_tokens      = Column(Integer, nullable=True)
+    execution_time_ms = Column(Integer, nullable=False)
+
+    entity_type = Column(String(32), nullable=True)
+    entity_id   = Column(String(128), nullable=True)
+
+    created_at = Column(DateTime(timezone=True),
+                        default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        Index("ix_llm_execution_logs_tenant_org_created",
+              "tenant_id", "org_unit_id", created_at.desc()),
+        Index("ix_llm_execution_logs_entity", "entity_type", "entity_id"),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Knowledge Base (KB) Tables — SEPARATE subsystem, out of scope, untouched
 # ─────────────────────────────────────────────────────────────────────────────
 
 class KBDocument(Base):

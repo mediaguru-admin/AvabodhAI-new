@@ -26,6 +26,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from config.settings import get_settings
+from pipeline.llm_log import set_llm_context
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -73,6 +74,19 @@ class TenantGuardMiddleware(BaseHTTPMiddleware):
         # re-parsing headers themselves.
         request.state.tenant_id = tenant_id
         request.state.org_unit_id = org_unit_id
+
+        # X-Client-ID: optional, caller-declared name of the consuming
+        # project (e.g. "clariona-core"). Recorded as sent, not verified —
+        # it only labels rows in the LLM execution log (pipeline/llm_log.py).
+        # Set before call_next so the context reaches the route, its
+        # threadpool calls, and its background tasks.
+        request.state.client_id = request.headers.get("x-client-id", "").strip() or None
+        set_llm_context(
+            tenant_id=tenant_id,
+            org_unit_id=org_unit_id,
+            client_id=request.state.client_id,
+            request_id=getattr(request.state, "request_id", None),
+        )
 
         if path not in _EXEMPT_PATHS and not path.startswith("/health") and not _is_signed_file_link(path):
             missing = []

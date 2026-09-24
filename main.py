@@ -12,12 +12,14 @@ from api.middleware.logging_middleware import LoggingMiddleware
 from api.middleware.tenant_guard_middleware import TenantGuardMiddleware
 from db.database import init_db, sweep_orphaned_uploads
 from pipeline.vector_store import ensure_collections
+from pipeline.llm_log import flush_llm_log_producer
 from config.settings import get_settings
 from utils.logger import get_logger
 from api.routes import search
 from api.routes import chat
 from api.routes.web import router as web_router
 from api.routes import kb
+from api.routes import llm_logs
 from config.settings import get_settings
 
 logger = get_logger(__name__)
@@ -270,6 +272,7 @@ async def lifespan(app: FastAPI):
 
     yield
     logger.info("Shutting down Avabodh API...")
+    flush_llm_log_producer()
 
 
 app = FastAPI(
@@ -333,6 +336,7 @@ app.include_router(chat.router, prefix="/chat", tags=["Chat"])
 app.include_router(search.router, prefix="/search", tags=["Search"])
 app.include_router(web_router, prefix="/web", tags=["Web Scraping"])
 app.include_router(kb.router, prefix="/kb", tags=["Knowledge Base"])
+app.include_router(llm_logs.router, prefix="/llm-logs", tags=["LLM Logs"])
 
 
 @app.get("/", tags=["Root"])
