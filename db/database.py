@@ -143,6 +143,66 @@ def _bootstrap_rls(conn) -> None:
     logger.info("Row-Level Security enabled + forced on: %s", ", ".join(_ISOLATED_TABLES))
 
 
+def _bootstrap_document_registry_rename(conn) -> None:
+    """
+    2026-08-21 architecture change (chunk storage moved to Qdrant, see
+    db/models.py's module docstring and pipeline/vector_store.py):
+    document_summaries -> documents. MUST run before create_all() below —
+    create_all() only creates tables that don't exist yet, so if it ran
+    first on a pre-migration database it would silently create a brand
+    new, EMPTY `documents` table (since ORM Document.__tablename__ is
+    "documents"), leaving the old, populated document_summaries sitting
+    orphaned right next to it rather than actually being renamed.
+
+    Guarded so this is a true no-op on both a fresh database (never had
+    document_summaries — create_all() alone builds `documents` correctly)
+    and an already-migrated one (idempotent, matching every other
+    bootstrap step in this file).
+    """
+    old_exists = conn.execute(text(
+        "SELECT 1 FROM information_schema.tables WHERE table_name = 'document_summaries'"
+    )).first()
+    new_exists = conn.execute(text(
+        "SELECT 1 FROM information_schema.tables WHERE table_name = 'documents'"
+    )).first()
+    if not old_exists or new_exists:
+        return
+
+    logger.warning(
+        "Migrating legacy document_summaries table to documents "
+        "(one-time, first boot after the Qdrant chunk-storage architecture change)"
+    )
+    conn.execute(text("ALTER TABLE document_summaries RENAME TO documents"))
+
+
+def _bootstrap_document_registry_columns(conn) -> None:
+    """
+    New Document lifecycle/metadata columns from the same 2026-08-21
+    change as _bootstrap_document_registry_rename() above — split into
+    its own step because it must run AFTER create_all(), the opposite
+    ordering constraint: create_all() can't add these to a table that
+    doesn't exist yet on a database that still needs the rename above.
+
+    Existing rows are presumed already-ingested documents from before
+    this column existed, so they're backfilled to 'READY' rather than
+    the model's own default of 'UPLOADED' (which means "ingestion not
+    finished yet") — being new to just this column is not the same as
+    being mid-processing.
+    """
+    conn.execute(text("""
+        ALTER TABLE documents
+          ADD COLUMN IF NOT EXISTS status        VARCHAR(16) NOT NULL DEFAULT 'READY',
+          ADD COLUMN IF NOT EXISTS status_detail TEXT,
+          ADD COLUMN IF NOT EXISTS processed_at  TIMESTAMPTZ,
+          ADD COLUMN IF NOT EXISTS file_type     VARCHAR(16),
+          ADD COLUMN IF NOT EXISTS file_size     INTEGER,
+          ADD COLUMN IF NOT EXISTS source        VARCHAR(16) DEFAULT 'upload',
+          ADD COLUMN IF NOT EXISTS stored_path   VARCHAR(1024),
+          ADD COLUMN IF NOT EXISTS metadata      JSONB
+    """))
+    conn.execute(text("UPDATE documents SET status = 'READY' WHERE status = 'UPLOADED'"))
+
+
 def _bootstrap_chat_memory_columns(conn) -> None:
     """
     create_all() only creates tables that don't exist yet — it cannot ALTER
@@ -182,10 +242,14 @@ def init_db() -> None:
     now only needs the plain tables below.
     """
     try:
+        with _admin_engine.begin() as conn:
+            _bootstrap_document_registry_rename(conn)
+
         Base.metadata.create_all(bind=_admin_engine)
         logger.info("Database tables verified / created successfully.")
 
         with _admin_engine.begin() as conn:
+            _bootstrap_document_registry_columns(conn)
             _bootstrap_chat_memory_columns(conn)
             _bootstrap_chat_degraded_column(conn)
             _bootstrap_app_role(conn)
