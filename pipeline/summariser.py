@@ -13,6 +13,7 @@ Reduce step: Single LLM call combines all chunk summaries into one,
              followed by one structured-output call for document metadata
 """
 
+import contextvars
 import os
 import re
 import time
@@ -30,6 +31,7 @@ from langsmith import traceable
 
 from db.models import ChunkMetadataOutput, DocumentMetadataOutput
 from config.settings import get_settings
+from pipeline.llm_log import llm_log_kwargs
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -135,7 +137,7 @@ SECTION SUMMARIES:
 )
 
 
-def _build_llm(max_tokens: int) -> ChatOpenAI:
+def _build_llm(max_tokens: int, purpose: str) -> ChatOpenAI:
     if settings.use_ollama:
         if ChatOllama is not None:
             return ChatOllama(
@@ -143,6 +145,7 @@ def _build_llm(max_tokens: int) -> ChatOpenAI:
                 base_url=settings.ollama_url,
                 temperature=settings.LLM_TEMPERATURE,
                 max_tokens=max_tokens,
+                **llm_log_kwargs(purpose),
             )
         return ChatOpenAI(
             api_key="ollama",
@@ -150,6 +153,7 @@ def _build_llm(max_tokens: int) -> ChatOpenAI:
             model=settings.OLLAMA_CHAT_MODEL,
             temperature=settings.LLM_TEMPERATURE,
             max_tokens=max_tokens,
+            **llm_log_kwargs(purpose),
         )
     return ChatOpenAI(
         api_key=settings.OPENAI_API_KEY,
@@ -162,6 +166,7 @@ def _build_llm(max_tokens: int) -> ChatOpenAI:
         # one hung call held a worker for as long as the network let it.
         timeout=settings.LLM_REQUEST_TIMEOUT,
         max_retries=settings.LLM_MAX_RETRIES,
+        **llm_log_kwargs(purpose),
     )
 
 
@@ -230,9 +235,11 @@ def summarise_document(chunks: list[Document], doc_name: str = "document") -> di
     )
 
     start = time.time()
-    base_llm = _build_llm(settings.MAP_MAX_TOKENS)
+    # One model instance per purpose so each call is tagged correctly in
+    # the LLM execution log (pipeline/llm_log.py) — construction is cheap.
+    fallback_llm = _build_llm(settings.MAP_MAX_TOKENS, "doc_chunk_summary")
     # Structured output LLM — forces Pydantic-validated ChunkMetadataOutput shape
-    structured_llm = base_llm.with_structured_output(ChunkMetadataOutput)
+    structured_llm = _build_llm(settings.MAP_MAX_TOKENS, "doc_chunk_metadata").with_structured_output(ChunkMetadataOutput)
 
     # ── Step 3: MAP — parallel processing with metadata ────────────────────
     chunk_args = [
@@ -246,7 +253,9 @@ def summarise_document(chunks: list[Document], doc_name: str = "document") -> di
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {
-            executor.submit(_extract_chunk_metadata, args): args[0]
+            # copy_context: worker threads don't inherit contextvars, and the
+            # LLM log needs this document's tenant/entity context.
+            executor.submit(contextvars.copy_context().run, _extract_chunk_metadata, args): args[0]
             for args in chunk_args
         }
         completed = 0
@@ -259,7 +268,7 @@ def summarise_document(chunks: list[Document], doc_name: str = "document") -> di
                 # Fallback to plain summarisation if structured extraction failed
                 _, text, _ = chunk_args[index]
                 fallback_idx, fallback_summary = _summarise_chunk(
-                    (index, text, base_llm)
+                    (index, text, fallback_llm)
                 )
                 chunk_summaries[fallback_idx] = fallback_summary
             completed += 1
@@ -280,7 +289,7 @@ def summarise_document(chunks: list[Document], doc_name: str = "document") -> di
     )
 
     # ── Step 4: REDUCE — single call ─────────────────────────────────────
-    reduce_llm = _build_llm(settings.REDUCE_MAX_TOKENS)
+    reduce_llm = _build_llm(settings.REDUCE_MAX_TOKENS, "doc_summary")
     combined = "\n\n".join(chunk_summaries)
 
     if len(combined) > 12000:
@@ -339,7 +348,7 @@ def summarise_document(chunks: list[Document], doc_name: str = "document") -> di
     # ── NEW — Step 5: Document-level metadata extraction (ONE extra call) ──
     document_metadata = None
     try:
-        metadata_llm = base_llm.with_structured_output(DocumentMetadataOutput)
+        metadata_llm = _build_llm(settings.MAP_MAX_TOKENS, "doc_metadata").with_structured_output(DocumentMetadataOutput)
         metadata_chain = DOCUMENT_METADATA_PROMPT | metadata_llm
         document_metadata = metadata_chain.invoke({
             "summary":  final_summary,

@@ -55,11 +55,11 @@ engine = create_engine(
 
 SessionFactory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
-# The 3 tables that carry tenant_id/org_unit_id and need RLS. document_chunks
+# The tables that carry tenant_id/org_unit_id and need RLS. document_chunks
 # is gone as of 2026-08-21 — chunk data (and its tenant/org tags) now lives
 # in Qdrant, which has no RLS equivalent; pipeline/retriever.py::build_filter()
 # is the sole isolation control for chunks. See CLAUDE.md / the plan doc.
-_ISOLATED_TABLES = ["documents", "chat_threads", "chat_messages"]
+_ISOLATED_TABLES = ["documents", "chat_threads", "chat_messages", "llm_execution_logs"]
 
 
 def _bootstrap_app_role(conn) -> None:
@@ -98,7 +98,7 @@ def _bootstrap_app_role(conn) -> None:
 
 def _bootstrap_rls(conn) -> None:
     """
-    Enable + FORCE Row-Level Security on the 4 isolated tables, with a
+    Enable + FORCE Row-Level Security on the isolated tables, with a
     policy that only allows a row to be SEEN if it matches the
     tenant_id/org_unit_id set on the current session (via set_config()
     in get_db_session_fastapi/get_db_session_context below).

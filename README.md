@@ -126,6 +126,12 @@ All routes below require `X-Tenant-ID` + `X-Org-Unit-ID` headers, except
 `/`, `/health*`, `/docs`, `/redoc`, `/openapi.json`, and
 `GET /documents/{id}/file` (signed-token authorized instead).
 
+Optional `X-Client-ID` names the calling project (e.g. `clariona-core`); it is
+recorded on LLM execution logs as sent, not authenticated. With
+`LLM_LOG_KAFKA_ENABLED=true` each log is also published as an
+`llm.execution.logged.v1` event (topic from `LLM_LOG_KAFKA_TOPIC_TEMPLATE`) —
+see `pipeline/llm_log.py`.
+
 | Method | Path | Notes |
 |---|---|---|
 | POST | `/documents/upload` | Async — registers immediately (`status=UPLOADED`), ingests in the background. Poll `GET /documents/{id}` for `status`. |
@@ -141,6 +147,8 @@ All routes below require `X-Tenant-ID` + `X-Org-Unit-ID` headers, except
 | POST/GET/PATCH/DELETE | `/chat/threads*` | Thread CRUD. |
 | GET | `/chat/search` | Semantic search across chat history (Qdrant-backed). |
 | POST | `/web/scrape` | Single page / batch / full-site crawl. Registers inline, ingests in the background. |
+| GET | `/llm-logs/` | LLM execution log for this tenant/org unit: one row per chat-completion / vision call (purpose, model, tokens, latency, status). Filters: `purpose`, `status`, `client_id`, `model_name`, `entity_type`, `entity_id`, `created_from`/`created_to`; `include_text=true` adds prompt/response text. |
+| GET | `/llm-logs/{id}` | One log row with prompt/response text. |
 | GET | `/health/`, `/health/db`, `/health/qdrant` | Health checks. |
 
 There's also a separate `/kb/*` subsystem (`api/routes/kb.py`) — an
