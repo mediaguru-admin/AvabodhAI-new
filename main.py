@@ -19,6 +19,7 @@ from api.routes import search
 from api.routes import chat
 from api.routes.web import router as web_router
 from api.routes import kb
+from api.routes import internal
 from api.routes import llm_logs
 from config.settings import get_settings
 
@@ -336,6 +337,7 @@ app.include_router(chat.router, prefix="/chat", tags=["Chat"])
 app.include_router(search.router, prefix="/search", tags=["Search"])
 app.include_router(web_router, prefix="/web", tags=["Web Scraping"])
 app.include_router(kb.router, prefix="/kb", tags=["Knowledge Base"])
+app.include_router(internal.router, prefix="/internal", tags=["Internal"])
 app.include_router(llm_logs.router, prefix="/llm-logs", tags=["LLM Logs"])
 
 
